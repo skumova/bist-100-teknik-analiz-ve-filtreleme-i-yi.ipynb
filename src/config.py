@@ -149,5 +149,11 @@ SCANNER_TOP_N = 10
 SCANNER_TRAIN_BARS = 750
 SCANNER_OPTUNA_TRIALS = 15
 
+# --- Canlı tarama döngüsü (src/live_scanner.py) ---
+MARKET_TIMEZONE = "Europe/Istanbul"
+DATA_DELAY_MINUTES = 15         # ücretsiz veri kaynaklarında (TradingView/yfinance) tipik gecikme
+LIVE_SCAN_INTERVAL_MINUTES = 15 # tarama periyodu; veri gecikmesiyle eşleşecek şekilde ayarlanmıştır
+                                # (daha sık taramanın faydası yoktur - aynı gecikmeli veri döner)
+
 # --- Genel ---
 RANDOM_STATE = 42
