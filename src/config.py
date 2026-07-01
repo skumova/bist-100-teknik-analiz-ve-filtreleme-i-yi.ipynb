@@ -122,5 +122,32 @@ MARKET_OPEN = "10:00"               # BIST seans açılışı
 MARKET_CLOSE = "18:00"              # BIST seans kapanışı
 SESSION_EDGE_EXCLUDE_MINUTES = 15   # açılış/kapanışa yakın gürültülü dakikalar
 
+# --- Piyasa taraması (scanner) ---
+# BIST 100 (XU100) endeksi bileşenleri. Zamanla endeks bileşimi değişebileceğinden
+# (giren/çıkan hisseler) bu listeyi periyodik olarak güncellemeniz önerilir.
+BIST100_SYMBOLS = [
+    "BTCIM", "KUYAS", "TCELL", "TTKOM", "VESTL", "PETKM", "SISE", "MGROS",
+    "ENKAI", "YKBNK", "ISMEN", "HALKB", "AKSEN", "TSKB", "DOAS", "ZOREN",
+    "VAKBN", "DOHOL", "SKBNK", "AKBNK", "GSRAY", "SARKY", "FENER", "TKFEN",
+    "BIMAS", "BRSAN", "ANSGR", "GARAN", "FROTO", "TUPRS", "ECILC", "BSOKE",
+    "TOASO", "ODAS", "KRDMD", "ASELS", "CIMSA", "EREGL", "EKGYO", "ALARK",
+    "KCHOL", "PGSUS", "ARCLK", "ISCTR", "TUKAS", "ULKER", "CCOLA", "BRYAT",
+    "THYAO", "HEKTS", "IEYHO", "AEFES", "TAVHL", "SASA", "OTKAR", "SAHOL",
+    "AKSA", "GUBRF", "MAVI", "BERA", "ENJSA", "MPARK", "RALYH", "SOKM",
+    "OYAKC", "TURSG", "ESEN", "QUAGR", "CANTE", "GENIL", "GESAN", "MAGEN",
+    "MIATK", "PSGYO", "DAPGM", "GRSEL", "EUREN", "KLRHO", "ASTOR", "CVKMD",
+    "EUPWR", "CWENE", "KTLEV", "PASEU", "IZENR", "ENERY", "REEDR", "PATEK",
+    "OBAMS", "ODINE", "ALTNY", "GRTHO", "GLRMK", "DSTKF", "BALSU", "EFOR",
+    "PAHOL", "TRENJ", "TRMET", "TRALT",
+]
+
+# Bir hisse için önbellekteki model bu kadar günden eskiyse otomatik olarak
+# yeniden eğitilir ("kendi kendini güncelleyen" tarama için tazelik eşiği).
+MODEL_MAX_AGE_DAYS = 7
+SCANNER_TOP_N = 10
+# Sembol başına tek seferlik (walk-forward döngüsüz) eğitim için pencere/optimizasyon ayarları
+SCANNER_TRAIN_BARS = 750
+SCANNER_OPTUNA_TRIALS = 15
+
 # --- Genel ---
 RANDOM_STATE = 42
