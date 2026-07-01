@@ -326,6 +326,12 @@ class WalkForwardEngine:
 
 
 def predict_latest(model: XGBClassifier, feature_row: pd.Series, feature_columns: list[str]) -> float:
-    """Canlı işlem döngüsü için tek satırlık (en güncel bar) yukarı yön olasılığı."""
-    X = feature_row[feature_columns].to_frame().T
+    """Canlı işlem döngüsü için tek satırlık (en güncel bar) yukarı yön olasılığı.
+
+    `feature_row`, filtre (bool) kolonlarıyla karışık bir DataFrame'den
+    `.iloc[-1]` ile alınmış olabilir; bu durumda Series dtype'ı object'e
+    yükselir. XGBoost'un sayısal olmayan dtype'ları reddetmemesi için
+    açıkça float'a çevriliyor.
+    """
+    X = feature_row[feature_columns].to_frame().T.astype(float)
     return float(model.predict_proba(X)[:, 1][0])
