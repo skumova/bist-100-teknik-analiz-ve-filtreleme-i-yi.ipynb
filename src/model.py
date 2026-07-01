@@ -60,15 +60,23 @@ def optimize_hyperparameters(
     y_train: pd.Series,
     n_trials: int = 20,
     random_state: int = config.RANDOM_STATE,
+    base_params: Optional[dict] = None,
 ) -> dict:
     """Optuna ile n_estimators / max_depth / learning_rate araması yapar.
 
     Optuna kurulu değilse veya yetersiz veri varsa varsayılan parametrelere
     (config.XGB_DEFAULT_PARAMS) düşer.
+
+    base_params: her deneme (trial) için taban alınacak parametre sözlüğü
+        (varsayılan config.XGB_DEFAULT_PARAMS). Örn. paralel piyasa
+        taramasında CPU aşırı-abonelikten kaçınmak için `{"n_jobs": 1}`
+        geçilebilir (bkz. src.scanner.scan_market max_workers).
     """
+    base_params = dict(base_params) if base_params else dict(config.XGB_DEFAULT_PARAMS)
+
     if len(X_train) < 100:
         logger.info("Eğitim verisi optimizasyon için çok küçük (%d satır); varsayılan parametreler kullanılacak.", len(X_train))
-        return dict(config.XGB_DEFAULT_PARAMS)
+        return base_params
 
     try:
         import optuna
@@ -76,7 +84,7 @@ def optimize_hyperparameters(
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
         logger.warning("optuna kurulu değil; varsayılan XGBoost parametreleri kullanılacak.")
-        return dict(config.XGB_DEFAULT_PARAMS)
+        return base_params
 
     split_idx = int(len(X_train) * 0.8)
     X_fit, X_val = X_train.iloc[:split_idx], X_train.iloc[split_idx:]
@@ -84,14 +92,14 @@ def optimize_hyperparameters(
 
     if y_fit.nunique() < 2 or y_val.nunique() < 2:
         logger.info("Optimizasyon alt kümesinde tek sınıf var; varsayılan parametreler kullanılacak.")
-        return dict(config.XGB_DEFAULT_PARAMS)
+        return base_params
 
     n_est_lo, n_est_hi = config.XGB_PARAM_SPACE["n_estimators"]
     depth_lo, depth_hi = config.XGB_PARAM_SPACE["max_depth"]
     lr_lo, lr_hi = config.XGB_PARAM_SPACE["learning_rate"]
 
     def objective(trial: "optuna.Trial") -> float:
-        params = dict(config.XGB_DEFAULT_PARAMS)
+        params = dict(base_params)
         params.update(
             n_estimators=trial.suggest_int("n_estimators", n_est_lo, n_est_hi, step=50),
             max_depth=trial.suggest_int("max_depth", depth_lo, depth_hi),
@@ -105,7 +113,7 @@ def optimize_hyperparameters(
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
-    best_params = dict(config.XGB_DEFAULT_PARAMS)
+    best_params = dict(base_params)
     best_params.update(study.best_params)
     logger.info("Optuna en iyi parametreler: %s (f1=%.4f)", study.best_params, study.best_value)
     return best_params
@@ -326,6 +334,12 @@ class WalkForwardEngine:
 
 
 def predict_latest(model: XGBClassifier, feature_row: pd.Series, feature_columns: list[str]) -> float:
-    """Canlı işlem döngüsü için tek satırlık (en güncel bar) yukarı yön olasılığı."""
-    X = feature_row[feature_columns].to_frame().T
+    """Canlı işlem döngüsü için tek satırlık (en güncel bar) yukarı yön olasılığı.
+
+    `feature_row`, filtre (bool) kolonlarıyla karışık bir DataFrame'den
+    `.iloc[-1]` ile alınmış olabilir; bu durumda Series dtype'ı object'e
+    yükselir. XGBoost'un sayısal olmayan dtype'ları reddetmemesi için
+    açıkça float'a çevriliyor.
+    """
+    X = feature_row[feature_columns].to_frame().T.astype(float)
     return float(model.predict_proba(X)[:, 1][0])

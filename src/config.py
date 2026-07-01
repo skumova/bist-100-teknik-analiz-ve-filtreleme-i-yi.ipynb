@@ -93,10 +93,61 @@ XGB_DEFAULT_PARAMS = {
 
 # --- Risk yönetimi / scalping kuralları ---
 ENTRY_PROBABILITY_THRESHOLD = 0.65
+EXIT_PROBABILITY_THRESHOLD = 0.35   # model görüşü tersine dönerse erken çıkış
 ATR_STOP_MULTIPLIER = 1.5
 ATR_TRAILING_MULTIPLIER = 1.0
 ATR_TAKE_PROFIT_MULTIPLIER = 2.5
 RISK_FREE_RATE_ANNUAL = 0.0
+
+# --- Pozisyon boyutlandırma ve devre kesici (circuit breaker) ---
+POSITION_SIZE_MODE = "vol_target"   # "fixed" (sabit %) veya "vol_target" (risk bazlı)
+RISK_PER_TRADE_PCT = 0.01           # vol_target modunda işlem başına riske edilen sermaye oranı
+MAX_CONSECUTIVE_LOSSES = 3          # bu sayıda üst üste zararlı işlemden sonra soğuma
+COOLDOWN_BARS_AFTER_LOSSES = 10     # soğuma süresi (bar sayısı)
+MAX_DAILY_LOSS_PCT = 0.03           # günlük zarar bu oranı aşarsa o gün yeni işlem açılmaz
+
+# --- Ek sinyal filtreleri (gerekirse devre dışı bırakılabilir) ---
+ADX_WINDOW = 14
+MIN_ADX = 20.0                      # bu değerin altında (yatay piyasa) işlem açılmaz
+VOLUME_WINDOW = 20
+MIN_VOLUME_RATIO = 0.7              # ortalama hacmin bu oranın altındaki barlar elenir
+VOL_REGIME_WINDOW = 100
+VOL_REGIME_LOWER_PCT = 0.05         # aşırı sakin (düşük oynaklık) rejimi ele
+VOL_REGIME_UPPER_PCT = 0.95         # aşırı oynak (kayma/gap riski yüksek) rejimi ele
+REQUIRE_TREND_ALIGNMENT = True      # sadece EMA(fast) > EMA(slow) iken long aç
+TREND_FAST_EMA = 21
+TREND_SLOW_EMA = 50
+SESSION_FILTER_ENABLED = True
+MARKET_OPEN = "10:00"               # BIST seans açılışı
+MARKET_CLOSE = "18:00"              # BIST seans kapanışı
+SESSION_EDGE_EXCLUDE_MINUTES = 15   # açılış/kapanışa yakın gürültülü dakikalar
+
+# --- Piyasa taraması (scanner) ---
+# BIST 100 (XU100) endeksi bileşenleri. Zamanla endeks bileşimi değişebileceğinden
+# (giren/çıkan hisseler) bu listeyi periyodik olarak güncellemeniz önerilir.
+BIST100_SYMBOLS = [
+    "BTCIM", "KUYAS", "TCELL", "TTKOM", "VESTL", "PETKM", "SISE", "MGROS",
+    "ENKAI", "YKBNK", "ISMEN", "HALKB", "AKSEN", "TSKB", "DOAS", "ZOREN",
+    "VAKBN", "DOHOL", "SKBNK", "AKBNK", "GSRAY", "SARKY", "FENER", "TKFEN",
+    "BIMAS", "BRSAN", "ANSGR", "GARAN", "FROTO", "TUPRS", "ECILC", "BSOKE",
+    "TOASO", "ODAS", "KRDMD", "ASELS", "CIMSA", "EREGL", "EKGYO", "ALARK",
+    "KCHOL", "PGSUS", "ARCLK", "ISCTR", "TUKAS", "ULKER", "CCOLA", "BRYAT",
+    "THYAO", "HEKTS", "IEYHO", "AEFES", "TAVHL", "SASA", "OTKAR", "SAHOL",
+    "AKSA", "GUBRF", "MAVI", "BERA", "ENJSA", "MPARK", "RALYH", "SOKM",
+    "OYAKC", "TURSG", "ESEN", "QUAGR", "CANTE", "GENIL", "GESAN", "MAGEN",
+    "MIATK", "PSGYO", "DAPGM", "GRSEL", "EUREN", "KLRHO", "ASTOR", "CVKMD",
+    "EUPWR", "CWENE", "KTLEV", "PASEU", "IZENR", "ENERY", "REEDR", "PATEK",
+    "OBAMS", "ODINE", "ALTNY", "GRTHO", "GLRMK", "DSTKF", "BALSU", "EFOR",
+    "PAHOL", "TRENJ", "TRMET", "TRALT",
+]
+
+# Bir hisse için önbellekteki model bu kadar günden eskiyse otomatik olarak
+# yeniden eğitilir ("kendi kendini güncelleyen" tarama için tazelik eşiği).
+MODEL_MAX_AGE_DAYS = 7
+SCANNER_TOP_N = 10
+# Sembol başına tek seferlik (walk-forward döngüsüz) eğitim için pencere/optimizasyon ayarları
+SCANNER_TRAIN_BARS = 750
+SCANNER_OPTUNA_TRIALS = 15
 
 # --- Genel ---
 RANDOM_STATE = 42

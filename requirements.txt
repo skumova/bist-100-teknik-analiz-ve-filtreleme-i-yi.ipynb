@@ -4,6 +4,8 @@
 # Veri kaynakları
 tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
 yfinance>=0.2.40
+requests>=2.31.0   # TradingView Scanner API'den tam BIST sembol listesi için
+lxml>=5.0.0        # pd.read_html yedek sembol kaynağı için
 
 # Veri işleme
 pandas>=2.2.0
