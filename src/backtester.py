@@ -1,0 +1,269 @@
+"""
+src/backtester.py
+==================
+
+Risk yönetimi ve backtest motoru.
+
+- Giriş: XGBoost'un ürettiği yukarı yön olasılığı (`proba_up`) belirlenen
+  eşiği (varsayılan %65) aştığında long pozisyon açılır (sadece BUY / vur-kaç,
+  açığa satış yoktur).
+- Çıkış: ATR tabanlı dinamik stop-loss, ATR tabanlı take-profit ve fiyat lehe
+  hareket ettikçe yükselen (iz süren) trailing stop.
+- Her çalıştırmada Sharpe Ratio, Maximum Drawdown ve Win/Loss Rate hesaplanır;
+  bu fonksiyonlar src.model.WalkForwardEngine'in `financial_metrics_fn`
+  callback'i olarak da kullanılabilir.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from src import config
+
+logger = logging.getLogger("bist_bot.backtester")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+_BARS_PER_YEAR = {
+    "1m": 252 * 60 * 8,
+    "5m": 252 * 12 * 8,
+    "15m": 252 * 4 * 8,
+    "30m": 252 * 2 * 8,
+    "1h": 252 * 8,
+    "4h": 252 * 2,
+    "1d": 252,
+}
+
+
+def estimate_periods_per_year(interval: str = config.DEFAULT_INTERVAL) -> int:
+    return _BARS_PER_YEAR.get(interval, 252 * 4 * 8)
+
+
+@dataclass
+class Trade:
+    entry_time: pd.Timestamp
+    entry_price: float
+    exit_time: pd.Timestamp
+    exit_price: float
+    exit_reason: str
+    shares: float
+    pnl: float
+    pnl_pct: float
+
+
+def _open_new_position(
+    row: pd.Series,
+    ts: pd.Timestamp,
+    capital: float,
+    position_size_pct: float,
+    fee_bps: float,
+    atr_col: str,
+    stop_mult: float,
+    tp_mult: float,
+) -> dict:
+    entry_price = float(row["close"])
+    atr_at_entry = float(row[atr_col])
+    allocation = capital * position_size_pct
+    shares = allocation / entry_price
+    entry_fee = allocation * (fee_bps / 10_000.0)
+
+    return {
+        "entry_time": ts,
+        "entry_price": entry_price,
+        "atr_at_entry": atr_at_entry,
+        "shares": shares,
+        "entry_fee": entry_fee,
+        "stop_loss": entry_price - stop_mult * atr_at_entry,
+        "take_profit": entry_price + tp_mult * atr_at_entry,
+        "trailing_stop": entry_price - stop_mult * atr_at_entry,
+    }
+
+
+def run_backtest(
+    df: pd.DataFrame,
+    proba_col: str = "proba_up",
+    atr_col: str = f"atr_{config.ATR_WINDOW}",
+    probability_threshold: float = config.ENTRY_PROBABILITY_THRESHOLD,
+    stop_mult: float = config.ATR_STOP_MULTIPLIER,
+    trail_mult: float = config.ATR_TRAILING_MULTIPLIER,
+    tp_mult: float = config.ATR_TAKE_PROFIT_MULTIPLIER,
+    initial_capital: float = 100_000.0,
+    position_size_pct: float = 1.0,
+    fee_bps: float = 5.0,
+    periods_per_year: Optional[int] = None,
+) -> dict:
+    """XGBoost sinyalleriyle ATR tabanlı risk yönetimini birleştiren backtest.
+
+    Parameters
+    ----------
+    df: `open, high, low, close, atr_...` ve `proba_up` (XGBoost olasılığı)
+        kolonlarını içeren, zaman sırasına göre sıralı DataFrame.
+    fee_bps: işlem başına baz puan cinsinden komisyon (varsayılan 5 bps).
+
+    Returns
+    -------
+    dict: {"trades": DataFrame, "equity_curve": Series, "metrics": dict}
+    """
+    required = {"open", "high", "low", "close", atr_col, proba_col}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"run_backtest: eksik kolonlar: {missing}")
+
+    periods_per_year = periods_per_year or estimate_periods_per_year()
+
+    capital = initial_capital
+    position: Optional[dict] = None
+    trades: list[Trade] = []
+    equity_curve = []
+    equity_index = []
+
+    for ts, row in df.iterrows():
+        close = float(row["close"])
+        high = float(row["high"])
+        low = float(row["low"])
+        atr = float(row[atr_col]) if pd.notna(row[atr_col]) else None
+
+        if position is not None:
+            # Trailing stop'u fiyat lehte hareket ettikçe yukarı çek (asla aşağı çekme)
+            if atr is not None:
+                candidate_trail = close - trail_mult * atr
+                position["trailing_stop"] = max(position["trailing_stop"], candidate_trail)
+
+            effective_stop = max(position["stop_loss"], position["trailing_stop"])
+
+            exit_price = None
+            exit_reason = None
+            # Kötümser (konservatif) varsayım: aynı barda hem stop hem TP'ye
+            # değinilmişse önce stop-loss tetiklenmiş kabul edilir.
+            if low <= effective_stop:
+                exit_price = min(effective_stop, high)
+                exit_reason = "trailing_stop" if effective_stop == position["trailing_stop"] else "stop_loss"
+            elif high >= position["take_profit"]:
+                exit_price = position["take_profit"]
+                exit_reason = "take_profit"
+
+            if exit_price is not None:
+                exit_fee = position["shares"] * exit_price * (fee_bps / 10_000.0)
+                gross_pnl = (exit_price - position["entry_price"]) * position["shares"]
+                pnl = gross_pnl - position["entry_fee"] - exit_fee
+                pnl_pct = pnl / (position["entry_price"] * position["shares"])
+
+                capital += pnl
+                trades.append(
+                    Trade(
+                        entry_time=position["entry_time"],
+                        entry_price=position["entry_price"],
+                        exit_time=ts,
+                        exit_price=exit_price,
+                        exit_reason=exit_reason,
+                        shares=position["shares"],
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                    )
+                )
+                position = None
+
+        if position is None and row[proba_col] >= probability_threshold and atr is not None and atr > 0:
+            position = _open_new_position(
+                row, ts, capital, position_size_pct, fee_bps, atr_col, stop_mult, tp_mult
+            )
+
+        # Mark-to-market öz sermaye (Sharpe / drawdown hesaplaması için)
+        unrealized = 0.0
+        if position is not None:
+            unrealized = (close - position["entry_price"]) * position["shares"]
+        equity_curve.append(capital + unrealized)
+        equity_index.append(ts)
+
+    # Açık kalan pozisyon varsa dönem sonunda kapat (mark-to-market realize et)
+    if position is not None:
+        last_row = df.iloc[-1]
+        exit_price = float(last_row["close"])
+        exit_fee = position["shares"] * exit_price * (fee_bps / 10_000.0)
+        gross_pnl = (exit_price - position["entry_price"]) * position["shares"]
+        pnl = gross_pnl - position["entry_fee"] - exit_fee
+        pnl_pct = pnl / (position["entry_price"] * position["shares"])
+        capital += pnl
+        trades.append(
+            Trade(
+                entry_time=position["entry_time"],
+                entry_price=position["entry_price"],
+                exit_time=df.index[-1],
+                exit_price=exit_price,
+                exit_reason="period_end",
+                shares=position["shares"],
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+            )
+        )
+        equity_curve[-1] = capital
+
+    equity_series = pd.Series(equity_curve, index=equity_index, name="equity")
+    trades_df = pd.DataFrame([t.__dict__ for t in trades])
+
+    metrics = compute_metrics_from_results(equity_series, trades_df, initial_capital, periods_per_year)
+    return {"trades": trades_df, "equity_curve": equity_series, "metrics": metrics}
+
+
+def compute_metrics_from_results(
+    equity_curve: pd.Series,
+    trades_df: pd.DataFrame,
+    initial_capital: float,
+    periods_per_year: int,
+) -> dict:
+    if equity_curve.empty:
+        return {
+            "total_return_pct": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown_pct": 0.0,
+            "win_rate": 0.0,
+            "num_trades": 0,
+            "avg_pnl_pct": 0.0,
+        }
+
+    period_returns = equity_curve.pct_change().dropna()
+    total_return_pct = (equity_curve.iloc[-1] / initial_capital - 1.0) * 100
+
+    if period_returns.std(ddof=0) > 1e-12:
+        sharpe = (period_returns.mean() / period_returns.std(ddof=0)) * np.sqrt(periods_per_year)
+    else:
+        sharpe = 0.0
+
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max
+    max_drawdown_pct = drawdown.min() * 100
+
+    if not trades_df.empty:
+        win_rate = float((trades_df["pnl"] > 0).mean())
+        avg_pnl_pct = float(trades_df["pnl_pct"].mean())
+    else:
+        win_rate = 0.0
+        avg_pnl_pct = 0.0
+
+    return {
+        "total_return_pct": float(total_return_pct),
+        "sharpe_ratio": float(sharpe),
+        "max_drawdown_pct": float(max_drawdown_pct),
+        "win_rate": win_rate,
+        "num_trades": int(len(trades_df)),
+        "avg_pnl_pct": avg_pnl_pct,
+    }
+
+
+def compute_financial_metrics(fold_df: pd.DataFrame, **kwargs) -> dict:
+    """src.model.WalkForwardEngine(financial_metrics_fn=...) için ince sarmalayıcı.
+
+    Her walk-forward fold'unun out-of-sample sinyalleriyle mini bir backtest
+    çalıştırıp sadece finansal metrikleri (Sharpe/Drawdown/WinRate) döndürür.
+    """
+    result = run_backtest(fold_df, **kwargs)
+    return result["metrics"]
