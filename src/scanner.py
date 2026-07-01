@@ -2,21 +2,31 @@
 src/scanner.py
 ================
 
-BIST piyasa taraması: tek bir hisse yerine, verilen sembol listesindeki
-(varsayılan: BIST-100) TÜM hisseleri tarar ve XGBoost modelinin ürettiği
-"yukarı yön olasılığına" (proba_up) göre en güvenilir adayları sıralar.
+BIST piyasa taraması: tek bir hisse yerine, Borsa İstanbul'da işlem gören
+TÜM hisseleri (~600+, sadece BIST-100 endeksi değil) tarar ve XGBoost
+modelinin ürettiği "yukarı yön olasılığına" (proba_up) göre en güvenilir
+adayları sıralar.
+
+Sembol evreni: `fetch_bist_symbols()` TradingView'in genel tarayıcı
+API'sinden BIST'teki tüm hisseleri dinamik olarak çeker (tvdatafeed ile aynı
+kaynak). Bu, borsaya yeni giren/çıkan hisseler olsa bile listenin güncel
+kalmasını sağlar. Ağ erişimi kısıtlıysa sırasıyla HTML tabanlı yedek
+kaynaklara ve son olarak `config.BIST100_SYMBOLS` çekirdek listesine düşer.
 
 Tasarım felsefesi - "eğit bir kere, tara sık sık":
 - Her sembol için model, `ensure_symbol_model()` ile diske önbelleğe alınır.
   Model dosyası `MODEL_MAX_AGE_DAYS` günden eskiyse (veya hiç yoksa) otomatik
   olarak yeniden eğitilir; bu da sistemin "kendi kendini güncelleyen" yapısını
-  100 hisse ölçeğinde sürdürür.
+  ~600 hisse ölçeğinde sürdürür.
 - Model eğitimi (Optuna hiperparametre araması dahil) görece pahalıdır ve
   periyodik olarak (varsayılan: haftada bir) yapılır.
 - Asıl tarama (scan_market) ise ucuzdur: BistDataLoader'ın önbelleği sayesinde
   sadece son bar(lar) çekilir, özellikler/filtreler hesaplanır ve önbellekteki
-  modelle tek satırlık bir tahmin yapılır. 100 hissenin taranması, modeller
-  zaten eğitilmişse birkaç dakikayı geçmez.
+  modelle tek satırlık bir tahmin yapılır. Modeller zaten eğitilmişse tüm
+  BIST'in taranması birkaç dakikayı geçmez.
+- `max_workers` > 1 ile semboller paralel taranabilir (~600 hisselik tam
+  taramada süreyi kısaltır); CPU aşırı-abonelikten kaçınmak için bu modda
+  XGBoost eğitimi otomatik olarak tek çekirdekte çalışır.
 - Bir sembolün verisi çekilemez veya model eğitilemezse tarama tamamen
   durmaz; o sembol "error" statüsüyle işaretlenip atlanır.
 """
@@ -25,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -52,6 +63,106 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 
+# ---------------------------------------------------------------------- #
+# BIST TAM LİSTESİ — sadece BIST-100 değil, borsadaki TÜM hisseler (~600+)
+# ---------------------------------------------------------------------- #
+def _fetch_from_tradingview_scanner(min_len: int = 2, max_len: int = 7, timeout: int = 20) -> list[str]:
+    """TradingView'in genel (kimlik doğrulama gerektirmeyen) tarayıcı API'sinden
+    BIST'te işlem gören TÜM hisseleri çeker. tvdatafeed ile aynı kaynaktır."""
+    import requests
+
+    url = "https://scanner.tradingview.com/turkey/scan"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Origin": "https://www.tradingview.com",
+        "Referer": "https://www.tradingview.com/",
+    }
+    payload = {
+        "filter": [],
+        "options": {"lang": "en"},
+        "symbols": {"query": {"types": ["stock"]}, "tickers": []},
+        "columns": ["name", "description", "type", "subtype", "exchange"],
+        "sort": {"sortBy": "name", "sortOrder": "asc"},
+        "range": [0, 2000],
+    }
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+
+    symbols: list[str] = []
+    for row in data.get("data", []):
+        cols = row.get("d") or []
+        ticker = cols[0] if cols else None
+        if ticker and isinstance(ticker, str):
+            clean = ticker.split(":")[-1].strip().upper()
+            if clean.isalpha() and min_len <= len(clean) <= max_len:
+                symbols.append(clean)
+    return list(dict.fromkeys(symbols))  # tekrarları kaldır, sırayı koru
+
+
+def _fetch_bist_fallback_html(min_len: int = 2, max_len: int = 7, timeout: int = 15) -> list[str]:
+    """TradingView API'ye ulaşılamazsa HTML tablo tabanlı yedek kaynakları dener."""
+    import requests
+
+    sources = [
+        "https://www.isyatirim.com.tr/analysis/fundamental/equity/index",
+        "https://finans.mynet.com/borsa/hisseler/",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for url in sources:
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            tables = pd.read_html(resp.text)
+            symbols = []
+            for table in tables:
+                for col in table.select_dtypes("object").columns:
+                    for val in table[col].dropna().astype(str):
+                        val = val.strip().upper()
+                        if val.isalpha() and min_len <= len(val) <= max_len:
+                            symbols.append(val)
+            unique = list(dict.fromkeys(symbols))
+            if len(unique) > 50:
+                return unique
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Yedek kaynak başarısız (%s): %s", url, exc)
+            continue
+    return []
+
+
+def fetch_bist_symbols() -> list[str]:
+    """BIST'te işlem gören TÜM hisselerin (~600+, sadece BIST-100 değil) güncel
+    listesini döndürür.
+
+    Öncelik sırası:
+    1. TradingView Scanner API (dinamik, güncel, kimlik doğrulama gerekmez)
+    2. HTML tablo tabanlı yedek kaynaklar (isyatirim.com.tr, mynet finans)
+    3. `config.BIST100_SYMBOLS` (statik ama doğrulanmış 100 hisselik çekirdek liste)
+
+    Ağ erişimi kısıtlı ortamlarda (ör. bazı kurumsal/izole ağlar) otomatik
+    olarak 3. seçeneğe düşer; böylece tarama asla tamamen başarısız olmaz.
+    """
+    try:
+        symbols = _fetch_from_tradingview_scanner()
+        if symbols:
+            logger.info("TradingView Scanner: %d BIST hissesi çekildi.", len(symbols))
+            return symbols
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("TradingView Scanner API başarısız: %s", exc)
+
+    symbols = _fetch_bist_fallback_html()
+    if symbols:
+        logger.info("Yedek kaynaktan %d BIST hissesi çekildi.", len(symbols))
+        return symbols
+
+    logger.warning(
+        "Tüm dinamik kaynaklar başarısız; config.BIST100_SYMBOLS kullanılıyor (%d hisse).",
+        len(config.BIST100_SYMBOLS),
+    )
+    return list(config.BIST100_SYMBOLS)
+
+
 def _model_path(symbol: str) -> Path:
     return config.MODEL_CACHE_DIR / f"{symbol.upper()}_xgb.json"
 
@@ -70,6 +181,7 @@ def train_symbol_model(
     optuna_trials: int = config.SCANNER_OPTUNA_TRIALS,
     use_optuna: bool = True,
     holdout_bars: int = config.WALK_FORWARD_MIN_TEST_BARS,
+    xgb_n_jobs: int = -1,
 ) -> WalkForwardEngine:
     """Tek bir sembol için (walk-forward döngüsü olmadan) tek seferlik model eğitir.
 
@@ -97,10 +209,14 @@ def train_symbol_model(
     X_train, y_train = train_slice[FEATURE_COLUMNS], train_slice["label"]
     X_holdout, y_holdout = holdout_slice[FEATURE_COLUMNS], holdout_slice["label"]
 
+    base_params = dict(config.XGB_DEFAULT_PARAMS)
+    base_params["n_jobs"] = xgb_n_jobs  # paralel tarama sırasında CPU aşırı-abonelikten kaçınmak için
+
     if use_optuna:
-        params = optimize_hyperparameters(X_train, y_train, n_trials=optuna_trials)
+        params = optimize_hyperparameters(X_train, y_train, n_trials=optuna_trials, base_params=base_params)
     else:
-        params = dict(config.XGB_DEFAULT_PARAMS)
+        params = base_params
+    params["n_jobs"] = xgb_n_jobs
 
     holdout_model = train_xgb(X_train, y_train, params)
     holdout_proba = holdout_model.predict_proba(X_holdout)[:, 1]
@@ -201,6 +317,7 @@ def scan_market(
     force_retrain: bool = False,
     max_age_days: float = config.MODEL_MAX_AGE_DAYS,
     apply_filters: bool = True,
+    max_workers: int = 1,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     train_kwargs: Optional[dict] = None,
 ) -> pd.DataFrame:
@@ -208,33 +325,59 @@ def scan_market(
 
     Parameters
     ----------
-    symbols: taranacak sembol listesi (varsayılan: config.BIST100_SYMBOLS).
+    symbols: taranacak sembol listesi. None ise `fetch_bist_symbols()` ile
+        BIST'teki TÜM hisseler (~600+, sadece BIST-100 değil) dinamik olarak
+        çekilir. Daha hızlı/küçük bir tarama için `config.BIST100_SYMBOLS`
+        veya kendi listenizi geçebilirsiniz.
     loader: paylaşılan bir BistDataLoader (önbelleği tekrar kullanmak için).
         None ise yeni bir tane oluşturulur.
     force_retrain: True ise tüm semboller için model yaşına bakılmaksızın
         yeniden eğitim yapılır.
     apply_filters: True ise ADX/hacim/volatilite/trend/seans filtreleri
         uygulanır ve `tradable` kolonu eklenir (bkz. src.filters).
+    max_workers: 1'den büyükse semboller `ThreadPoolExecutor` ile paralel
+        taranır (~600 hisselik tam taramada süreyi önemli ölçüde kısaltır).
+        CPU aşırı-abonelikten kaçınmak için >1 olduğunda XGBoost eğitimi
+        otomatik olarak `n_jobs=1` ile çalışır (train_kwargs içinde
+        `xgb_n_jobs` açıkça verilmediği sürece).
     progress_callback: (index, total, symbol) imzalı, her sembol sonrası
         çağrılan opsiyonel ilerleme fonksiyonu (Colab'de canlı ilerleme
-        göstermek için kullanışlıdır).
+        göstermek için kullanışlıdır). Paralel modda çağrılar tamamlanma
+        sırasına göre gelir (girdi sırasına göre değil).
 
     Returns
     -------
     En yüksek `proba_up` en üstte olacak şekilde sıralanmış DataFrame.
     Başarısız semboller `status == "error"` ile en altta yer alır.
     """
-    symbols = symbols or list(config.BIST100_SYMBOLS)
+    symbols = list(symbols) if symbols is not None else fetch_bist_symbols()
     loader = loader or BistDataLoader()
-    train_kwargs = train_kwargs or {}
+    train_kwargs = dict(train_kwargs or {})
+    if max_workers > 1:
+        train_kwargs.setdefault("xgb_n_jobs", 1)
 
-    results: list[ScanResult] = []
     total = len(symbols)
-    for i, symbol in enumerate(symbols, start=1):
-        result = _scan_single_symbol(symbol, loader, force_retrain, max_age_days, apply_filters, train_kwargs)
-        results.append(result)
-        if progress_callback is not None:
-            progress_callback(i, total, symbol)
+    results: list[ScanResult] = []
+
+    if max_workers <= 1:
+        for i, symbol in enumerate(symbols, start=1):
+            result = _scan_single_symbol(symbol, loader, force_retrain, max_age_days, apply_filters, train_kwargs)
+            results.append(result)
+            if progress_callback is not None:
+                progress_callback(i, total, symbol)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _scan_single_symbol, symbol, loader, force_retrain, max_age_days, apply_filters, train_kwargs
+                ): symbol
+                for symbol in symbols
+            }
+            for i, future in enumerate(as_completed(futures), start=1):
+                symbol = futures[future]
+                results.append(future.result())
+                if progress_callback is not None:
+                    progress_callback(i, total, symbol)
 
     df = pd.DataFrame([r.__dict__ for r in results])
     ok_mask = df["status"] == "ok"
