@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Proje önbelleği ve çıktıları
+cache/
+logs/
+*.log
+
+# Modeller
+*.joblib
+*.pkl
+models/*.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
