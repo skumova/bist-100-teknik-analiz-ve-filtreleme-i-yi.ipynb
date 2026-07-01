@@ -26,3 +26,4 @@ matplotlib>=3.8.0
 # Yardımcılar
 joblib>=1.3.0
 pytz>=2024.1
+tzdata>=2024.1    # zoneinfo için (bazı ortamlarda sistem saat dilimi verisi eksik olabilir)
