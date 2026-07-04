@@ -53,56 +53,100 @@ def _call_with_timeout(fn, timeout: float, *args, **kwargs):
 # ---------------------------------------------------------------------- #
 # OHLCV
 # ---------------------------------------------------------------------- #
-def _fetch_yf_daily(symbol: str, n_bars: int) -> pd.DataFrame:
-    """yfinance ile doğrudan günlük OHLCV (hızlı, Colab'da güvenilir, takılmaz)."""
-    import yfinance as yf
-
-    sym = symbol.upper()
-    if not sym.endswith(".IS"):
-        sym += ".IS"
-    years = max(2, n_bars // 252 + 1)
-    raw = yf.download(sym, period=f"{years}y", interval="1d", progress=False,
-                      auto_adjust=False, multi_level_index=False)
-    if raw is None or raw.empty:
-        raise RuntimeError(f"yfinance boş veri döndürdü: {sym}")
-    raw.columns = [str(c).lower() for c in raw.columns]
-    if "close" not in raw.columns and "adj close" in raw.columns:
-        raw = raw.rename(columns={"adj close": "close"})
-    df = raw[["open", "high", "low", "close", "volume"]].copy()
+def _normalize_ohlcv(raw: pd.DataFrame, n_bars: int) -> pd.DataFrame:
+    """Farklı kaynaklardan gelen OHLCV'yi standart open/high/low/close/volume'a indirger."""
+    df = raw.copy()
+    df.columns = [str(c).lower() for c in df.columns]
+    if "close" not in df.columns and "adj close" in df.columns:
+        df = df.rename(columns={"adj close": "close"})
+    missing = [c for c in ("open", "high", "low", "close", "volume") if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"eksik OHLCV kolonları: {missing} (mevcut: {list(df.columns)})")
+    df = df[["open", "high", "low", "close", "volume"]]
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_localize(None)
     df.index.name = "datetime"
     return df.sort_index().tail(n_bars)
 
 
-def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "yfinance",
-                     timeout: float = 25.0) -> pd.DataFrame:
-    """Günlük OHLCV döndürür.
+def _period_for(n_bars: int) -> str:
+    """n_bars işlem gününü kapsayacak borsapy/yfinance period etiketi."""
+    if n_bars <= 480:
+        return "2y"
+    if n_bars <= 1200:
+        return "5y"
+    return "10y"
 
-    source="yfinance" (VARSAYILAN): doğrudan yfinance — hızlı, güvenilir, Colab'da
-        kanıtlanmış; git-install / websocket gerektirmez, sekmeyi dondurmaz.
-    source="tvdatafeed": TradingView (rongardF fork) verisi. `BistDataLoader`
-        üzerinden çekilir; bir sembolde başarısız olur / boş döner / `timeout` sn
-        içinde bitmezse O SEMBOL için otomatik yfinance'a düşülür (tarama tek bir
-        sembolde takılmaz/kilitlenmez).
+
+def _fetch_borsapy_daily(symbol: str, n_bars: int) -> pd.DataFrame:
+    """borsapy ile günlük OHLCV — BIST için EN TEMİZ/SAĞLIKLI kaynak (TradingView backend)."""
+    import borsapy
+
+    raw = borsapy.Ticker(symbol.upper()).history(
+        period=_period_for(n_bars), interval="1d", auto_adjust=False
+    )
+    if raw is None or len(raw) == 0:
+        raise RuntimeError(f"borsapy boş veri döndürdü: {symbol}")
+    return _normalize_ohlcv(raw, n_bars)
+
+
+def _fetch_yf_daily(symbol: str, n_bars: int) -> pd.DataFrame:
+    """yfinance ile günlük OHLCV (yedek). Not: BIST'te bazı sembollerde eksik/hatalı olabilir."""
+    import yfinance as yf
+
+    sym = symbol.upper()
+    if not sym.endswith(".IS"):
+        sym += ".IS"
+    raw = yf.download(sym, period=_period_for(n_bars), interval="1d", progress=False,
+                      auto_adjust=False, multi_level_index=False)
+    if raw is None or raw.empty:
+        raise RuntimeError(f"yfinance boş veri döndürdü: {sym}")
+    return _normalize_ohlcv(raw, n_bars)
+
+
+# Her "source" için denenecek kaynak zinciri (ilki asıl, kalanı yedek)
+_SOURCE_CHAINS = {
+    "borsapy": ["borsapy", "yfinance"],
+    "tvdatafeed": ["tvdatafeed", "yfinance"],
+    "yfinance": ["yfinance"],
+}
+
+
+def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "borsapy",
+                     timeout: float = 25.0, return_source: bool = False):
+    """Günlük OHLCV döndürür. BIST için önerilen kaynak sırası borsapy → yfinance.
+
+    source="borsapy" (VARSAYILAN): borsapy (TradingView backend) — BIST'te en
+        temiz/sağlıklı veri. Başarısız olur / `timeout` sn içinde bitmezse O SEMBOL
+        için yfinance'a düşülür.
+    source="tvdatafeed": TradingView (rongardF fork) `BistDataLoader` üzerinden;
+        yedeği yfinance.
+    source="yfinance": yalnızca yfinance.
+
+    return_source=True ise (df, kullanılan_kaynak) döner. Her fetch bir thread +
+    zaman aşımıyla sarılıdır; bir sembol askıda kalırsa atlanır, tarama kilitlenmez.
     """
-    if source == "tvdatafeed":
+    chain = _SOURCE_CHAINS.get(source, [source])
+    last_exc = None
+    for src in chain:
         try:
-            if loader is None:
-                from src.data_loader import BistDataLoader
+            if src == "tvdatafeed":
+                if loader is None:
+                    from src.data_loader import BistDataLoader
 
-                loader = BistDataLoader(interval="1d")
-            df = _call_with_timeout(loader.get_history, timeout, symbol, n_bars=n_bars)
+                    loader = BistDataLoader(interval="1d")
+                df = _call_with_timeout(loader.get_history, timeout, symbol, n_bars=n_bars)
+            elif src == "borsapy":
+                df = _call_with_timeout(_fetch_borsapy_daily, timeout, symbol, n_bars)
+            else:
+                df = _call_with_timeout(_fetch_yf_daily, timeout, symbol, n_bars)
             if df is not None and len(df) >= 60:
-                return df
-            logger.debug("[%s] tvdatafeed yetersiz bar döndürdü, yfinance'a düşülüyor.", symbol)
+                return (df, src) if return_source else df
+            last_exc = RuntimeError(f"{src}: yetersiz bar")
         except Exception as exc:  # noqa: BLE001  (TimeoutError dahil)
-            logger.debug("[%s] tvdatafeed başarısız/zaman aşımı (%s), yfinance'a düşülüyor.", symbol, exc)
-        try:
-            return _call_with_timeout(_fetch_yf_daily, timeout, symbol, n_bars)
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"{symbol}: hem tvdatafeed hem yfinance başarısız ({exc})")
-    return _call_with_timeout(_fetch_yf_daily, timeout, symbol, n_bars)
+            last_exc = exc
+            logger.debug("[%s] %s başarısız (%s), sıradaki kaynağa geçiliyor.", symbol, src, exc)
+    raise RuntimeError(f"{symbol}: hiçbir kaynaktan veri alınamadı ({last_exc})")
 
 
 def average_tl_volume(df: pd.DataFrame, window: int = 20) -> Optional[float]:
@@ -207,8 +251,9 @@ def screen_universe(
     with_ladder_top_n: int = 15,
     tech_prefilter: bool = True,
     prefilter_margin: float = 10.0,
-    source: str = "yfinance",
+    source: str = "borsapy",
     progress_every: int = 25,
+    fetch_timeout: float = 12.0,
 ):
     """Sembol listesini uçtan uca tarar: veri çek -> skorla -> raporla.
 
@@ -239,7 +284,7 @@ def screen_universe(
 
     results = []
     failed = 0
-    consec_fail = 0
+    primary_miss = 0                 # birincil kaynağın (borsapy/tvdatafeed) üst üste ıskalaması
     effective_source = source
     gate = dv.TECH_GATE - prefilter_margin
     total = len(symbols)
@@ -247,7 +292,9 @@ def screen_universe(
         try:
             # Sembol başına TÜM stdout/stderr'i /dev/null'a yönlendir (çıktı seli = donma)
             with _cl.redirect_stdout(_devnull), _cl.redirect_stderr(_devnull):
-                df = load_daily_ohlcv(sym, n_bars=n_bars, loader=loader, source=effective_source)
+                df, used = load_daily_ohlcv(sym, n_bars=n_bars, loader=loader,
+                                            source=effective_source, timeout=fetch_timeout,
+                                            return_source=True)
                 if df is None or len(df) < 60:
                     raise RuntimeError("yetersiz OHLCV")
                 # Teknik ön-eleme: kapıyı geçemeyecek kadar pahalıysa temel veri çekme
@@ -261,19 +308,22 @@ def screen_universe(
                     avg_tl_volume=average_tl_volume(df),
                 )
             results.append((res, df, ratios))
-            consec_fail = 0
+            # Birincil kaynak ıskaladı mı? (veri geldi ama yedekten)
+            primary_miss = 0 if (effective_source == "yfinance" or used == effective_source) else primary_miss + 1
         except Exception:  # noqa: BLE001  (veri yok / zaman aşımı / hesap hatası)
             failed += 1
-            consec_fail += 1
-            # tvdatafeed bu ortamda hiç yanıt vermiyorsa kalanları yfinance'a çevir
-            if effective_source == "tvdatafeed" and consec_fail >= 8:
-                effective_source = "yfinance"
-                loader = None
-                _real_out.write("  ⚠ tvdatafeed yanıt vermiyor; kalan semboller yfinance ile çekiliyor.\n")
-                _real_out.flush()
+            primary_miss += (effective_source != "yfinance")
+        # Birincil kaynak (borsapy/tvdatafeed) sürekli ıskalıyorsa kalanları doğrudan
+        # yfinance'a çevir — her sembolde timeout beklemenin ağır bedelini önle.
+        if effective_source != "yfinance" and primary_miss >= 6:
+            _real_out.write(f"  ⚠ '{effective_source}' bu ortamda çalışmıyor; kalan semboller "
+                            f"yfinance ile çekiliyor.\n")
+            _real_out.flush()
+            effective_source, loader = "yfinance", None
         # İlerleme: yalnızca bunu göster (gerçek çıktıya, bastırılmadan)
         if progress_every and (i % progress_every == 0 or i == total):
-            _real_out.write(f"  … {i}/{total} tarandı | {len(results)} geçerli, {failed} atlandı\n")
+            _real_out.write(f"  … {i}/{total} tarandı | {len(results)} geçerli, {failed} atlandı "
+                            f"[{effective_source}]\n")
             _real_out.flush()
 
     ranked = sorted((r[0] for r in results), key=lambda x: x.final_score, reverse=True)
