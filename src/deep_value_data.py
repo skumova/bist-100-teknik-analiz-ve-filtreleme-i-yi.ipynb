@@ -35,17 +35,43 @@ logger.setLevel(logging.INFO)
 # ---------------------------------------------------------------------- #
 # OHLCV
 # ---------------------------------------------------------------------- #
-def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None) -> pd.DataFrame:
-    """Günlük OHLCV döndürür (tvdatafeed -> yfinance yedek).
+def _fetch_yf_daily(symbol: str, n_bars: int) -> pd.DataFrame:
+    """yfinance ile doğrudan günlük OHLCV (hızlı, Colab'da güvenilir, takılmaz)."""
+    import yfinance as yf
 
-    `loader` verilmezse yeni bir BistDataLoader('1d') oluşturur. Toplu taramada
-    tek bir loader'ı yeniden kullanmak (önbellek paylaşımı için) önerilir.
+    sym = symbol.upper()
+    if not sym.endswith(".IS"):
+        sym += ".IS"
+    years = max(2, n_bars // 252 + 1)
+    raw = yf.download(sym, period=f"{years}y", interval="1d", progress=False,
+                      auto_adjust=False, multi_level_index=False)
+    if raw is None or raw.empty:
+        raise RuntimeError(f"yfinance boş veri döndürdü: {sym}")
+    raw.columns = [str(c).lower() for c in raw.columns]
+    if "close" not in raw.columns and "adj close" in raw.columns:
+        raw = raw.rename(columns={"adj close": "close"})
+    df = raw[["open", "high", "low", "close", "volume"]].copy()
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    df.index.name = "datetime"
+    return df.sort_index().tail(n_bars)
+
+
+def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "yfinance") -> pd.DataFrame:
+    """Günlük OHLCV döndürür.
+
+    source="yfinance" (VARSAYILAN): doğrudan yfinance — hızlı, takılmaz, Colab
+        için önerilir.
+    source="tvdatafeed": TradingView (rongardF fork) — `BistDataLoader` üzerinden;
+        anonim modda yavaş/kararsız olabilir, yalnızca gerektiğinde kullanın.
     """
-    if loader is None:
-        from src.data_loader import BistDataLoader
+    if source == "tvdatafeed":
+        if loader is None:
+            from src.data_loader import BistDataLoader
 
-        loader = BistDataLoader(interval="1d")
-    return loader.get_history(symbol, n_bars=n_bars)
+            loader = BistDataLoader(interval="1d")
+        return loader.get_history(symbol, n_bars=n_bars)
+    return _fetch_yf_daily(symbol, n_bars)
 
 
 def average_tl_volume(df: pd.DataFrame, window: int = 20) -> Optional[float]:
@@ -150,6 +176,8 @@ def screen_universe(
     with_ladder_top_n: int = 15,
     tech_prefilter: bool = True,
     prefilter_margin: float = 10.0,
+    source: str = "yfinance",
+    progress_every: int = 25,
 ):
     """Sembol listesini uçtan uca tarar: veri çek -> skorla -> raporla.
 
@@ -161,15 +189,22 @@ def screen_universe(
     Dönüş: (rapor_df, results) — rapor_df sıralı özet tablo, results ise
     her sembol için tam DeepValueResult listesi (Fibonacci merdivenleri dahil).
     """
+    import sys as _sys
     from src import deep_value as dv
-    from src.data_loader import BistDataLoader
 
-    loader = BistDataLoader(interval="1d")
+    loader = None
+    if source == "tvdatafeed":
+        from src.data_loader import BistDataLoader
+        loader = BistDataLoader(interval="1d")
+
     results = []
     gate = dv.TECH_GATE - prefilter_margin
-    for sym in symbols:
+    total = len(symbols)
+    for i, sym in enumerate(symbols, 1):
+        if progress_every and (i % progress_every == 0 or i == total):
+            print(f"  … {i}/{total} tarandı ({len(results)} geçerli)", flush=True)
         try:
-            df = load_daily_ohlcv(sym, n_bars=n_bars, loader=loader)
+            df = load_daily_ohlcv(sym, n_bars=n_bars, loader=loader, source=source)
             if df is None or len(df) < 60:
                 logger.warning("[%s] yetersiz OHLCV, atlanıyor.", sym)
                 continue
