@@ -628,10 +628,11 @@ class FibLadder:
     swing_high: float
     swing_low: float
     current_price: float
-    rungs: list[dict]          # her biri: {ratio, price, weight_pct, note}
+    rungs: list[dict]          # her biri: {ratio, price, weight_pct, note, dip_pct}
     hard_stop: float
     dcf_target: Optional[float] = None
     expected_upside_pct: Optional[float] = None
+    mid_recovery: Optional[float] = None    # konservatif teknik hedef: H->L düşüşünün %50 geri alımı
 
 
 # Düşüşün Fibonacci oranları (H->L düşüşünün kesri olarak) ve dilim ağırlıkları.
@@ -653,71 +654,59 @@ def fibonacci_ladder(
     n_rungs: int = 3,
     atr_stop_mult: float = 1.5,
     dcf_target: Optional[float] = None,
+    max_depth: float = 0.22,
 ) -> FibLadder:
-    """Dövülmüş hisse için kademeli alım merdiveni.
+    """Dövülmüş hisse için SINIRLI, UYGULANABİLİR kademeli alım merdiveni.
 
-    Mantık: son `lookback` bardaki baskın SWING'i (en yüksek tepe H, en düşük
-    dip L) al. H->L düşüşünün Fibonacci seviyeleri referans alınır. Alım
-    kademeleri yalnızca GÜNCEL FİYATIN ALTINDAKİ (ya da hemen üstündeki)
-    seviyelere konur — hisse düştükçe kademeli alırsın, ortalama maliyet düşer.
-    Daha derin kademeye daha çok ağırlık verilir.
-
-    Stop: en derin kademenin ATR katı kadar altına konur ("bu da tutmazsa tez
-    yanlış" seviyesi).
+    Tasarım gerekçesi: Fibonacci UZANTILARINI (1.272/1.618) tüm swing aralığının
+    altına projekte etmek, geniş aralıklı BIST hisselerinde en derin kademeyi
+    güncelin %60-80 altına atıyordu (gerçekleşmeyecek, sermaye yanlış tahsisi).
+    Bunun yerine kademeler GÜNCEL FİYAT ile bir TABAN (floor) arasına konur:
+      * taban = son swing dip (gerçek destek),
+      * fiyat zaten dipteyse band ~%10 kapitülasyon için aşağı uzatılır,
+      * hiçbir kademe güncelin `max_depth`'ından (vars. %22) daha derin olmaz.
+    Band, Fibonacci geri-çekilme oranlarıyla (0 / 0.5 / 1.0) 3 kademeye bölünür;
+    daha derin kademeye biraz daha çok ağırlık verilir. Stop, band tabanının ATR
+    katı altına konur (mantıklı bir aralıkta sınırlanır).
     """
     win = df.tail(lookback)
     H = float(win["high"].max())
     L = float(win["low"].min())
     price = float(df["close"].iloc[-1])
-    rng = max(H - L, 1e-9)
-    atr_val = float(atr(df, 14).iloc[-1]) if len(df) > 15 else rng * 0.03
+    atr_val = float(atr(df, 14).iloc[-1]) if len(df) > 15 else price * 0.03
 
-    # Aday seviyeler (fiyat cinsinden). ratio, düşüşün kesri: price_r = H - ratio*(H-L)
-    candidates = []
-    for ratio, note in _FIB_RATIOS:
-        lvl = H - ratio * rng
-        candidates.append({"ratio": ratio, "price": round(lvl, 4), "note": note})
+    # --- Alım bandı tabanı (floor): sınırlı ve uygulanabilir ---
+    floor_c = min(L, price * 0.995)                    # swing dip ya da güncelin hemen altı
+    if price - floor_c < price * 0.08:                 # fiyat zaten dipte -> kapitülasyon için band aç
+        floor_c = price * 0.90
+    floor = max(floor_c, price * (1.0 - max_depth))    # güncelin en fazla max_depth altı
+    band = max(price - floor, price * 0.02)
 
-    # Yalnızca güncel fiyatın %2 üstü ve altındaki seviyeler alım kademesi olur
-    buyable = [c for c in candidates if c["price"] <= price * 1.02]
-    # Güncel fiyata en yakından başlayıp aşağı doğru sırala
-    buyable.sort(key=lambda c: -c["price"])
-
-    # İlk kademe güncel fiyata yakın olsun: en yakın buyable seviye %6'dan fazla
-    # aşağıdaysa, ilk kademe olarak MEVCUT FİYATı ekle (hemen birikime başla).
-    if not buyable or buyable[0]["price"] < price * 0.94:
-        buyable.insert(0, {"ratio": 0.0, "price": round(price, 4), "note": "mevcut fiyat (ilk kademe)"})
-
-    rungs = buyable[:n_rungs]
-    # 3 kademeye tamamlanamadıysa swing dip / uzantı ile doldur
-    if len(rungs) < n_rungs:
-        for ratio, note in [(1.0, "swing dip retesti"), (1.272, "kapitülasyon uzantısı"), (1.618, "aşırı kapitülasyon")]:
-            lvl = round(H - ratio * rng, 4)
-            if lvl < rungs[-1]["price"] and all(abs(lvl - r["price"]) > 1e-6 for r in rungs):
-                rungs.append({"ratio": ratio, "price": lvl, "note": note})
-            if len(rungs) >= n_rungs:
-                break
-
-    # Ağırlıklar: derine daha çok. n_rungs'a göre artan profil.
-    base_weights = {
-        1: [1.0],
-        2: [0.4, 0.6],
-        3: [0.25, 0.35, 0.40],
-        4: [0.20, 0.25, 0.30, 0.25],
-        5: [0.15, 0.20, 0.25, 0.25, 0.15],
-    }.get(len(rungs), None)
-    if base_weights is None:
-        base_weights = [1.0 / len(rungs)] * len(rungs)
-    for rung, w in zip(rungs, base_weights):
-        rung["weight_pct"] = round(w * 100, 1)
+    # --- 3 kademe: bandı Fibonacci geri-çekilme oranlarıyla böl (0=güncel, 1=taban) ---
+    rung_specs = [
+        (0.0, "1. kademe — güncel / hafif dip"),
+        (0.5, "2. kademe — orta dip (0.5 Fib)"),
+        (1.0, "3. kademe — band tabanı (swing dip / kapitülasyon)"),
+    ][:n_rungs]
+    weight_profiles = {1: [1.0], 2: [0.45, 0.55], 3: [0.30, 0.33, 0.37]}
+    ws = weight_profiles.get(n_rungs, [1.0 / n_rungs] * n_rungs)
+    rungs = []
+    for (ratio, note), w in zip(rung_specs, ws):
+        p = price - ratio * band
+        rungs.append({"ratio": round(ratio, 3), "price": round(p, 4),
+                      "weight_pct": round(w * 100, 1), "note": note,
+                      "dip_pct": round((p / price - 1) * 100, 1)})
 
     deepest = min(r["price"] for r in rungs)
-    hard_stop = round(deepest - atr_stop_mult * atr_val, 4)
+    # Stop: band tabanının ATR katı altı; sanity ile en fazla (max_depth+%10) aşağı
+    hard_stop = round(max(deepest - atr_stop_mult * atr_val, price * (1.0 - max_depth - 0.10)), 4)
 
+    # Konservatif teknik toparlanma hedefi: H->L düşüşünün %50'sinin geri alınması
+    mid_recovery = round(L + 0.5 * (H - L), 4)
+
+    avg_cost = sum(r["price"] * r["weight_pct"] for r in rungs) / sum(r["weight_pct"] for r in rungs)
     upside = None
     if dcf_target is not None and dcf_target > 0:
-        # Merdivenin ağırlıklı ortalama maliyetine göre beklenen getiri
-        avg_cost = sum(r["price"] * r["weight_pct"] for r in rungs) / sum(r["weight_pct"] for r in rungs)
         upside = round((dcf_target / avg_cost - 1) * 100, 1)
 
     return FibLadder(
@@ -728,6 +717,7 @@ def fibonacci_ladder(
         hard_stop=hard_stop,
         dcf_target=dcf_target,
         expected_upside_pct=upside,
+        mid_recovery=mid_recovery,
     )
 
 
