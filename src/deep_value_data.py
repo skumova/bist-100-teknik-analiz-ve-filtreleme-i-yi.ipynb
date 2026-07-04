@@ -33,6 +33,24 @@ logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------- #
+# Zaman aşımı yardımcısı (bir sembol askıda kalırsa taramayı kilitlemesin)
+# ---------------------------------------------------------------------- #
+_EXECUTOR = None
+
+
+def _call_with_timeout(fn, timeout: float, *args, **kwargs):
+    """fn'i ayrı bir thread'de çalıştırır; `timeout` sn içinde bitmezse
+    TimeoutError yükseltir (askıdaki iş arka planda bırakılır, akış devam eder)."""
+    global _EXECUTOR
+    import concurrent.futures as _cf
+
+    if _EXECUTOR is None:
+        _EXECUTOR = _cf.ThreadPoolExecutor(max_workers=4)
+    fut = _EXECUTOR.submit(fn, *args, **kwargs)
+    return fut.result(timeout=timeout)
+
+
+# ---------------------------------------------------------------------- #
 # OHLCV
 # ---------------------------------------------------------------------- #
 def _fetch_yf_daily(symbol: str, n_bars: int) -> pd.DataFrame:
@@ -57,14 +75,16 @@ def _fetch_yf_daily(symbol: str, n_bars: int) -> pd.DataFrame:
     return df.sort_index().tail(n_bars)
 
 
-def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "tvdatafeed") -> pd.DataFrame:
+def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "yfinance",
+                     timeout: float = 25.0) -> pd.DataFrame:
     """Günlük OHLCV döndürür.
 
-    source="tvdatafeed" (VARSAYILAN): TradingView (rongardF fork) verisi — teknik
-        göstergeler için tercih edilen kaynak. `BistDataLoader` üzerinden çekilir;
-        bir sembolde başarısız olur / boş dönerse O SEMBOL için otomatik olarak
-        yfinance'a düşülür (tarama asla tek bir sembolde takılmaz/durmaz).
-    source="yfinance": doğrudan yfinance (tvdatafeed'e hiç dokunmadan).
+    source="yfinance" (VARSAYILAN): doğrudan yfinance — hızlı, güvenilir, Colab'da
+        kanıtlanmış; git-install / websocket gerektirmez, sekmeyi dondurmaz.
+    source="tvdatafeed": TradingView (rongardF fork) verisi. `BistDataLoader`
+        üzerinden çekilir; bir sembolde başarısız olur / boş döner / `timeout` sn
+        içinde bitmezse O SEMBOL için otomatik yfinance'a düşülür (tarama tek bir
+        sembolde takılmaz/kilitlenmez).
     """
     if source == "tvdatafeed":
         try:
@@ -72,14 +92,17 @@ def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = 
                 from src.data_loader import BistDataLoader
 
                 loader = BistDataLoader(interval="1d")
-            df = loader.get_history(symbol, n_bars=n_bars)
+            df = _call_with_timeout(loader.get_history, timeout, symbol, n_bars=n_bars)
             if df is not None and len(df) >= 60:
                 return df
             logger.debug("[%s] tvdatafeed yetersiz bar döndürdü, yfinance'a düşülüyor.", symbol)
+        except Exception as exc:  # noqa: BLE001  (TimeoutError dahil)
+            logger.debug("[%s] tvdatafeed başarısız/zaman aşımı (%s), yfinance'a düşülüyor.", symbol, exc)
+        try:
+            return _call_with_timeout(_fetch_yf_daily, timeout, symbol, n_bars)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[%s] tvdatafeed başarısız (%s), yfinance'a düşülüyor.", symbol, exc)
-        return _fetch_yf_daily(symbol, n_bars)
-    return _fetch_yf_daily(symbol, n_bars)
+            raise RuntimeError(f"{symbol}: hem tvdatafeed hem yfinance başarısız ({exc})")
+    return _call_with_timeout(_fetch_yf_daily, timeout, symbol, n_bars)
 
 
 def average_tl_volume(df: pd.DataFrame, window: int = 20) -> Optional[float]:
@@ -184,7 +207,7 @@ def screen_universe(
     with_ladder_top_n: int = 15,
     tech_prefilter: bool = True,
     prefilter_margin: float = 10.0,
-    source: str = "tvdatafeed",
+    source: str = "yfinance",
     progress_every: int = 25,
 ):
     """Sembol listesini uçtan uca tarar: veri çek -> skorla -> raporla.
@@ -197,8 +220,17 @@ def screen_universe(
     Dönüş: (rapor_df, results) — rapor_df sıralı özet tablo, results ise
     her sembol için tam DeepValueResult listesi (Fibonacci merdivenleri dahil).
     """
-    import sys as _sys
+    import sys as _sys, os as _os, warnings as _w, logging as _lg, contextlib as _cl
     from src import deep_value as dv
+
+    # Gürültülü çıktıyı sustur — yüzlerce sembolde tvdatafeed/yfinance'ın bastığı
+    # binlerce log/uyarı satırı Colab sekmesini DONDURUR. Bunu kökten engelle.
+    _w.filterwarnings("ignore")
+    for _n in ("bist_bot", "bist_bot.deep_value_data", "bist_bot.data_loader",
+               "tvDatafeed", "tvDatafeed.main", "websocket", "yfinance", "urllib3", "peewee"):
+        _lg.getLogger(_n).setLevel(_lg.CRITICAL)
+    _real_out = _sys.stdout           # ilerleme yazıları için (bastırılmayan) gerçek çıktı
+    _devnull = open(_os.devnull, "w")
 
     loader = None
     if source == "tvdatafeed":
@@ -206,29 +238,43 @@ def screen_universe(
         loader = BistDataLoader(interval="1d")
 
     results = []
+    failed = 0
+    consec_fail = 0
+    effective_source = source
     gate = dv.TECH_GATE - prefilter_margin
     total = len(symbols)
     for i, sym in enumerate(symbols, 1):
-        if progress_every and (i % progress_every == 0 or i == total):
-            print(f"  … {i}/{total} tarandı ({len(results)} geçerli)", flush=True)
         try:
-            df = load_daily_ohlcv(sym, n_bars=n_bars, loader=loader, source=source)
-            if df is None or len(df) < 60:
-                logger.warning("[%s] yetersiz OHLCV, atlanıyor.", sym)
-                continue
-            # Teknik ön-eleme: kapıyı geçemeyecek kadar pahalıysa temel veri çekme
-            if tech_prefilter and dv.technical_cheapness(df).total < gate:
-                ratios = {}
-            else:
-                ratios = fetch_fundamentals(sym, prefer_isyatirim=prefer_isyatirim)
-            res = dv.composite_score(
-                sym, df, ratios,
-                sector=ratios.get("sector"),
-                avg_tl_volume=average_tl_volume(df),
-            )
+            # Sembol başına TÜM stdout/stderr'i /dev/null'a yönlendir (çıktı seli = donma)
+            with _cl.redirect_stdout(_devnull), _cl.redirect_stderr(_devnull):
+                df = load_daily_ohlcv(sym, n_bars=n_bars, loader=loader, source=effective_source)
+                if df is None or len(df) < 60:
+                    raise RuntimeError("yetersiz OHLCV")
+                # Teknik ön-eleme: kapıyı geçemeyecek kadar pahalıysa temel veri çekme
+                if tech_prefilter and dv.technical_cheapness(df).total < gate:
+                    ratios = {}
+                else:
+                    ratios = fetch_fundamentals(sym, prefer_isyatirim=prefer_isyatirim)
+                res = dv.composite_score(
+                    sym, df, ratios,
+                    sector=ratios.get("sector"),
+                    avg_tl_volume=average_tl_volume(df),
+                )
             results.append((res, df, ratios))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] taranamadı: %s", sym, exc)
+            consec_fail = 0
+        except Exception:  # noqa: BLE001  (veri yok / zaman aşımı / hesap hatası)
+            failed += 1
+            consec_fail += 1
+            # tvdatafeed bu ortamda hiç yanıt vermiyorsa kalanları yfinance'a çevir
+            if effective_source == "tvdatafeed" and consec_fail >= 8:
+                effective_source = "yfinance"
+                loader = None
+                _real_out.write("  ⚠ tvdatafeed yanıt vermiyor; kalan semboller yfinance ile çekiliyor.\n")
+                _real_out.flush()
+        # İlerleme: yalnızca bunu göster (gerçek çıktıya, bastırılmadan)
+        if progress_every and (i % progress_every == 0 or i == total):
+            _real_out.write(f"  … {i}/{total} tarandı | {len(results)} geçerli, {failed} atlandı\n")
+            _real_out.flush()
 
     ranked = sorted((r[0] for r in results), key=lambda x: x.final_score, reverse=True)
     # En iyi N adaya Fibonacci merdiveni ekle
