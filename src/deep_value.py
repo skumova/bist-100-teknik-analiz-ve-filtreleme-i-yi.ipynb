@@ -548,7 +548,7 @@ def assess_value_trap(
 #   temel_katkı_çarpanı = 1 + FUND_BONUS_STRENGTH × (temel-50)/50   (±%20, sadece katkı)
 # "Aşırı ucuz" kapısı teknik ucuzluğa bakar (fiyat ne kadar dövülmüş); banker çekirdeğin
 # ikinci öncelikli bileşenidir (akıllı para topluyor mu). Temel yalnızca ince ayar yapar.
-TECH_GATE = 55.0             # "aşırı ucuz" eşiği (teknik): bunun altı derin-değer adayı sayılmaz
+TECH_GATE = 60.0             # "aşırı ucuz" eşiği (teknik): bunun altı derin-değer adayı sayılmaz
 CORE_W_TECH = 0.60           # ÖNCELİKLİ çekirdekte teknik ucuzluk ağırlığı
 CORE_W_BANKER = 0.40         # ÖNCELİKLİ çekirdekte banker/akıllı para ağırlığı
 FUND_BONUS_STRENGTH = 0.20   # temel kriter YALNIZCA puanlama katkısı (±%20)
