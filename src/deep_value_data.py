@@ -57,20 +57,28 @@ def _fetch_yf_daily(symbol: str, n_bars: int) -> pd.DataFrame:
     return df.sort_index().tail(n_bars)
 
 
-def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "yfinance") -> pd.DataFrame:
+def load_daily_ohlcv(symbol: str, n_bars: int = 600, loader=None, source: str = "tvdatafeed") -> pd.DataFrame:
     """Günlük OHLCV döndürür.
 
-    source="yfinance" (VARSAYILAN): doğrudan yfinance — hızlı, takılmaz, Colab
-        için önerilir.
-    source="tvdatafeed": TradingView (rongardF fork) — `BistDataLoader` üzerinden;
-        anonim modda yavaş/kararsız olabilir, yalnızca gerektiğinde kullanın.
+    source="tvdatafeed" (VARSAYILAN): TradingView (rongardF fork) verisi — teknik
+        göstergeler için tercih edilen kaynak. `BistDataLoader` üzerinden çekilir;
+        bir sembolde başarısız olur / boş dönerse O SEMBOL için otomatik olarak
+        yfinance'a düşülür (tarama asla tek bir sembolde takılmaz/durmaz).
+    source="yfinance": doğrudan yfinance (tvdatafeed'e hiç dokunmadan).
     """
     if source == "tvdatafeed":
-        if loader is None:
-            from src.data_loader import BistDataLoader
+        try:
+            if loader is None:
+                from src.data_loader import BistDataLoader
 
-            loader = BistDataLoader(interval="1d")
-        return loader.get_history(symbol, n_bars=n_bars)
+                loader = BistDataLoader(interval="1d")
+            df = loader.get_history(symbol, n_bars=n_bars)
+            if df is not None and len(df) >= 60:
+                return df
+            logger.debug("[%s] tvdatafeed yetersiz bar döndürdü, yfinance'a düşülüyor.", symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] tvdatafeed başarısız (%s), yfinance'a düşülüyor.", symbol, exc)
+        return _fetch_yf_daily(symbol, n_bars)
     return _fetch_yf_daily(symbol, n_bars)
 
 
@@ -176,7 +184,7 @@ def screen_universe(
     with_ladder_top_n: int = 15,
     tech_prefilter: bool = True,
     prefilter_margin: float = 10.0,
-    source: str = "yfinance",
+    source: str = "tvdatafeed",
     progress_every: int = 25,
 ):
     """Sembol listesini uçtan uca tarar: veri çek -> skorla -> raporla.
