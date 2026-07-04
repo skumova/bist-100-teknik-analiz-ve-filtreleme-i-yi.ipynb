@@ -567,6 +567,9 @@ class DeepValueResult:
     qualifies: bool                     # teknik kapıyı geçti mi (aşırı ucuz mu)
     ladder: Optional["FibLadder"] = None
     sector: Optional[str] = None
+    intrinsic_value: Optional[float] = None   # içsel değer (TL/hisse) — temel, teknikten AYRI
+    safety_margin: Optional[float] = None     # (içsel değer / fiyat - 1)
+    intrinsic_method: Optional[str] = None     # "Graham" / "FCF×8" vb.
 
 
 def composite_score(
@@ -611,6 +614,9 @@ def composite_score(
         fund_bonus=round(fund_bonus, 3),
         qualifies=bool(tech.total >= TECH_GATE and not trap.disqualified),
         sector=sector,
+        intrinsic_value=_num(ratios.get("dcf_intrinsic_value")),
+        safety_margin=_num(ratios.get("safety_margin")),
+        intrinsic_method=ratios.get("intrinsic_method"),
     )
 
 
@@ -745,6 +751,9 @@ def result_to_row(res: DeepValueResult) -> dict:
         "temel_carpan": res.fund_bonus, # temelin nihai skora çarpan katkısı
         "value": f.value,
         "quality": f.quality,
+        "icsel_deger": res.intrinsic_value,                    # temel: içsel değer (TL/hisse)
+        "guvenlik_marji_%": round(res.safety_margin * 100, 1) if res.safety_margin is not None else None,
+        "deger_yontemi": res.intrinsic_method,
         "rsi_d": round(t.raw.get("rsi_d"), 1) if t.raw.get("rsi_d") is not None else None,
         "rsi_w": round(t.raw["rsi_w"], 1) if t.raw.get("rsi_w") is not None else None,
         "pos_52w": round(t.raw["pos_52w"], 3) if t.raw.get("pos_52w") is not None else None,
