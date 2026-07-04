@@ -539,18 +539,19 @@ def assess_value_trap(
 # 5. Nihai birleşik skor
 # ====================================================================== #
 # Mimari (kullanıcı kurgusu):
-#   ANA BELİRLEYİCİ = teknik ucuzluk. Sıralamanın çıpası ve "aşırı ucuz" kapısı.
-#   EKSTRA PUANLAMA  = banker (akıllı para) + temel değer/kalite -> çarpan bonus.
-#   VALUE-TRAP       = ceza çarpanı (çürük malı ele).
+#   ÖNCELİKLİ ÇEKİRDEK = teknik ucuzluk + banker (akıllı para). Sıralamayı bunlar belirler.
+#   PUANLAMA KATKISI    = temel değer/kalite -> yalnızca ÖLÇÜLÜ çarpan katkısı (±%20).
+#   VALUE-TRAP          = ceza çarpanı (çürük malı ele).
 #
-# final = teknik × trap_çarpanı × bonus_çarpanı
-#   bonus_çarpanı = 1 + BONUS_STRENGTH × (ekstra-50)/50   (ekstra 0-100)
-#   -> ekstra=50 nötr (×1.0), ekstra=100 → ×(1+BONUS_STRENGTH), ekstra=0 → ×(1-BONUS_STRENGTH)
-# Böylece teknik çıpa kalır ama banker+temel sıralamayı anlamlı biçimde oynatır.
-TECH_GATE = 55.0            # "aşırı ucuz" eşiği: bunun altı derin-değer adayı sayılmaz
-BONUS_STRENGTH = 0.35       # ekstra katmanın nihai skoru oynatma gücü (±%35)
-EXTRA_W_BANKER = 0.45       # ekstra puan içinde banker ağırlığı
-EXTRA_W_FUND = 0.55         # ekstra puan içinde temel değer/kalite ağırlığı
+# final = çekirdek × trap_çarpanı × temel_katkı_çarpanı
+#   çekirdek = CORE_W_TECH·teknik + CORE_W_BANKER·banker   (ikisi de öncelikli)
+#   temel_katkı_çarpanı = 1 + FUND_BONUS_STRENGTH × (temel-50)/50   (±%20, sadece katkı)
+# "Aşırı ucuz" kapısı teknik ucuzluğa bakar (fiyat ne kadar dövülmüş); banker çekirdeğin
+# ikinci öncelikli bileşenidir (akıllı para topluyor mu). Temel yalnızca ince ayar yapar.
+TECH_GATE = 55.0             # "aşırı ucuz" eşiği (teknik): bunun altı derin-değer adayı sayılmaz
+CORE_W_TECH = 0.60           # ÖNCELİKLİ çekirdekte teknik ucuzluk ağırlığı
+CORE_W_BANKER = 0.40         # ÖNCELİKLİ çekirdekte banker/akıllı para ağırlığı
+FUND_BONUS_STRENGTH = 0.20   # temel kriter YALNIZCA puanlama katkısı (±%20)
 
 
 @dataclass
@@ -561,7 +562,8 @@ class DeepValueResult:
     banker: BankerScore
     fundamental: FundamentalScore
     trap: TrapAssessment
-    extra_score: float
+    core_score: float                   # öncelikli çekirdek (teknik+banker)
+    fund_bonus: float                   # temel kriterin katkı çarpanı (≈0.80–1.20)
     qualifies: bool                     # teknik kapıyı geçti mi (aşırı ucuz mu)
     ladder: Optional["FibLadder"] = None
     sector: Optional[str] = None
@@ -576,8 +578,8 @@ def composite_score(
 ) -> DeepValueResult:
     """Bir hisse için tam derin-değer değerlendirmesi.
 
-    Teknik ucuzluk ANA skordur; banker (akıllı para birikimi) ve temel
-    değer/kalite bunun üstüne EKSTRA çarpan bonusu uygular. Value-trap
+    ÖNCELİKLİ ÇEKİRDEK = teknik ucuzluk + banker (akıllı para). Temel değer/kalite
+    bunun üstüne YALNIZCA ölçülü bir puanlama katkısı (±%20) uygular. Value-trap
     bayrakları ayrıca ceza çarpanı getirir.
     """
     tech = technical_cheapness(df)
@@ -585,13 +587,16 @@ def composite_score(
     fund = fundamental_value_quality(ratios)
     trap = assess_value_trap(ratios, tech, avg_tl_volume=avg_tl_volume)
 
-    # Ekstra puan: banker + temel (temel None ise sadece banker)
-    extra = _wgeomean([(banker.total, EXTRA_W_BANKER), (fund.total, EXTRA_W_FUND)])
-    if extra is None:
-        extra = 50.0  # ekstra bilgi yoksa nötr
-    bonus_mult = 1.0 + BONUS_STRENGTH * (extra - 50.0) / 50.0
+    # Öncelikli çekirdek: teknik + banker (ikisi de öncelik)
+    core = _wmean([(tech.total, CORE_W_TECH), (banker.total, CORE_W_BANKER)]) or 0.0
 
-    final = tech.total * trap.multiplier * bonus_mult
+    # Temel kriter: yalnızca ölçülü katkı çarpanı (temel yoksa nötr)
+    if fund.total is not None:
+        fund_bonus = 1.0 + FUND_BONUS_STRENGTH * (fund.total - 50.0) / 50.0
+    else:
+        fund_bonus = 1.0
+
+    final = core * trap.multiplier * fund_bonus
     if trap.disqualified:
         final = 0.0
 
@@ -602,7 +607,8 @@ def composite_score(
         banker=banker,
         fundamental=fund,
         trap=trap,
-        extra_score=round(extra, 1),
+        core_score=round(core, 1),
+        fund_bonus=round(fund_bonus, 3),
         qualifies=bool(tech.total >= TECH_GATE and not trap.disqualified),
         sector=sector,
     )
@@ -732,10 +738,11 @@ def result_to_row(res: DeepValueResult) -> dict:
         "sector": res.sector,
         "final_score": res.final_score,
         "asiri_ucuz": res.qualifies,
-        "tech_ucuzluk": t.total,        # ANA belirleyici
-        "banker": b.total,              # ekstra: akıllı para birikimi
-        "temel_skor": f.total,          # ekstra: değer & kalite
-        "extra": res.extra_score,
+        "cekirdek": res.core_score,     # ÖNCELİK: teknik+banker
+        "tech_ucuzluk": t.total,        # öncelik 1
+        "banker": b.total,              # öncelik 2: akıllı para birikimi
+        "temel_skor": f.total,          # katkı: değer & kalite
+        "temel_carpan": res.fund_bonus, # temelin nihai skora çarpan katkısı
         "value": f.value,
         "quality": f.quality,
         "rsi_d": round(t.raw.get("rsi_d"), 1) if t.raw.get("rsi_d") is not None else None,

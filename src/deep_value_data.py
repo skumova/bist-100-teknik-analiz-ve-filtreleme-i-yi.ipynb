@@ -201,3 +201,146 @@ def screen_universe(
 
     report = dv.build_report(ranked)
     return report, ranked
+
+
+# ---------------------------------------------------------------------- #
+# Detaylı Excel çıktısı
+# ---------------------------------------------------------------------- #
+def _ladder_rows(results) -> "pd.DataFrame":
+    """Fibonacci merdivenlerini uzun-format (her kademe bir satır) tabloya çevirir."""
+    rows = []
+    for res in results:
+        if res.ladder is None:
+            continue
+        L = res.ladder
+        for i, r in enumerate(L.rungs, 1):
+            rows.append({
+                "symbol": res.symbol,
+                "final_score": res.final_score,
+                "kademe": i,
+                "fib_orani": r["ratio"],
+                "fiyat": r["price"],
+                "agirlik_%": r["weight_pct"],
+                "aciklama": r["note"],
+                "swing_high": L.swing_high,
+                "swing_low": L.swing_low,
+                "guncel_fiyat": L.current_price,
+                "hard_stop": L.hard_stop,
+                "dcf_hedef": L.dcf_target,
+                "beklenen_getiri_%": L.expected_upside_pct,
+            })
+    return pd.DataFrame(rows)
+
+
+def _detail_rows(results) -> "pd.DataFrame":
+    """Her hisse için tüm alt bileşenleri (teknik/banker/temel ham + skor) tek tabloda."""
+    rows = []
+    for res in results:
+        t, b, f = res.technical, res.banker, res.fundamental
+        rows.append({
+            "symbol": res.symbol,
+            "sector": res.sector,
+            "final_score": res.final_score,
+            "asiri_ucuz": res.qualifies,
+            "cekirdek": res.core_score,
+            "tech_ucuzluk": t.total,
+            "banker": b.total,
+            "temel_skor": f.total,
+            "temel_carpan": res.fund_bonus,
+            "trap_carpan": res.trap.multiplier,
+            "diskalifiye": res.trap.disqualified,
+            # Teknik ham
+            "rsi_d": round(t.raw.get("rsi_d"), 1) if t.raw.get("rsi_d") is not None else None,
+            "rsi_w": round(t.raw["rsi_w"], 1) if t.raw.get("rsi_w") is not None else None,
+            "pos_52w": round(t.raw["pos_52w"], 3) if t.raw.get("pos_52w") is not None else None,
+            "drawdown": round(t.raw["drawdown"], 3) if t.raw.get("drawdown") is not None else None,
+            "bb_percent_b": round(t.raw["bb_percent_b"], 3) if t.raw.get("bb_percent_b") is not None else None,
+            "ema200_dev": round(t.raw["ema200_dev"], 3) if t.raw.get("ema200_dev") is not None else None,
+            "williams_r": round(t.raw["williams_r"], 1) if t.raw.get("williams_r") is not None else None,
+            "high_52w": t.raw.get("high_52w"),
+            "low_52w": t.raw.get("low_52w"),
+            "dip_confirm": t.dip_confirm,
+            # Banker ham
+            "cmf": round(b.raw["cmf"], 3),
+            "mfi": round(b.raw["mfi"], 1),
+            "ad_slope": round(b.raw["ad_slope"], 2),
+            "obv_slope": round(b.raw["obv_slope"], 2),
+            "birikim_diverjans": b.accumulation,
+            # Temel skor bileşenleri
+            "value": f.value,
+            "quality": f.quality,
+            # Value-trap
+            "trap_flags": "; ".join(res.trap.flags) if res.trap.flags else "",
+        })
+    return pd.DataFrame(rows).sort_values("final_score", ascending=False).reset_index(drop=True)
+
+
+def export_to_excel(report, results, path: str = "bist_derin_deger_tarama.xlsx", capital: float = 100_000.0) -> str:
+    """Taramayı çok-sayfalı, biçimlendirilmiş detaylı bir Excel dosyasına yazar.
+
+    Sayfalar:
+      - Ozet        : sıralı özet tablo (build_report çıktısı)
+      - Adaylar     : teknik kapıyı geçen, tuzaksız hisseler
+      - Tuzaklar    : value-trap bayraklı / diskalifiye edilenler
+      - Detay       : tüm alt bileşenler (teknik/banker/temel ham değerler)
+      - Alim_Plani  : Fibonacci 3-kademe merdivenleri (uzun format) + TL/lot dağılımı
+    """
+    from src import deep_value as dv
+
+    detail = _detail_rows(results)
+    adaylar = detail[detail["asiri_ucuz"] & (~detail["diskalifiye"])].reset_index(drop=True)
+    tuzaklar = detail[(detail["trap_flags"] != "") | (detail["diskalifiye"])].reset_index(drop=True)
+    ladder = _ladder_rows(results)
+    if not ladder.empty:
+        ladder["kademe_TL"] = (capital * ladder["agirlik_%"] / 100).round(0)
+        ladder["yakl_lot"] = (ladder["kademe_TL"] / ladder["fiyat"]).astype(int)
+
+    try:
+        import openpyxl  # noqa
+        engine = "openpyxl"
+    except ImportError:
+        engine = None  # pandas varsayılanına bırak
+
+    with pd.ExcelWriter(path, engine=engine) as xl:
+        report.to_excel(xl, sheet_name="Ozet", index=False)
+        adaylar.to_excel(xl, sheet_name="Adaylar", index=False)
+        tuzaklar.to_excel(xl, sheet_name="Tuzaklar", index=False)
+        detail.to_excel(xl, sheet_name="Detay", index=False)
+        if not ladder.empty:
+            ladder.to_excel(xl, sheet_name="Alim_Plani", index=False)
+        _format_workbook(xl)
+
+    logger.info("Excel yazıldı: %s (%d hisse, %d aday)", path, len(detail), len(adaylar))
+    return path
+
+
+def _format_workbook(xl) -> None:
+    """Kolon genişliği + başlık + koşullu renk (openpyxl varsa)."""
+    try:
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.formatting.rule import ColorScaleRule
+    except Exception:  # noqa: BLE001
+        return
+    wb = xl.book
+    header_fill = PatternFill("solid", fgColor="1F2D3D")
+    header_font = Font(color="FFFFFF", bold=True)
+    for ws in wb.worksheets:
+        # Başlık satırı biçimi
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = "A2"
+        # Kolon genişlikleri
+        for col in ws.columns:
+            width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+            ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 9), 42)
+        # final_score kolonuna renk skalası (yeşil=yüksek)
+        header = {c.value: c.column_letter for c in ws[1]}
+        if "final_score" in header and ws.max_row > 1:
+            col = header["final_score"]
+            rng = f"{col}2:{col}{ws.max_row}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type="num", start_value=0, start_color="F8696B",
+                mid_type="num", mid_value=40, mid_color="FFEB84",
+                end_type="num", end_value=80, end_color="63BE7B"))
