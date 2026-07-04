@@ -234,7 +234,29 @@ class TechnicalScore:
     total: float
     components: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
-    dip_confirm: bool = False   # MACD histogramı yukarı dönüyor mu (düşüş ivmesi kırıldı)
+    dip_confirm: bool = False       # MACD histogramı yukarı dönüyor mu (düşüş ivmesi kırıldı)
+    rsi_divergence: bool = False    # pozitif RSI diverjansı (fiyat daha dip, RSI daha yüksek)
+
+
+def _bullish_rsi_divergence(df: pd.DataFrame, rsi_series: pd.Series,
+                            lookback: int = 40, min_gap: int = 5) -> bool:
+    """Pozitif (boğa) RSI diverjansı: fiyat yeni/eşit dip yaparken RSI daha yüksek dip
+    yapıyor → satış ivmesi tükeniyor, klasik dip/dönüş sinyali."""
+    n = len(df)
+    lb = min(lookback, n - 2)
+    if lb < 12:
+        return False
+    lows = df["low"].tail(lb).reset_index(drop=True)
+    rsis = rsi_series.tail(lb).reset_index(drop=True)
+    prior = lows.iloc[:-min_gap]
+    recent = lows.iloc[-min_gap:]
+    if len(prior) < 3 or len(recent) < 1:
+        return False
+    p_idx = int(prior.idxmin())     # prior/recent, lows ile aynı konumsal indeksi paylaşır
+    r_idx = int(recent.idxmin())
+    price_lower_low = lows.iloc[r_idx] <= lows.iloc[p_idx] * 1.01     # fiyat daha dip/eşit
+    rsi_higher_low = rsis.iloc[r_idx] > rsis.iloc[p_idx] + 2          # RSI daha yüksek dip
+    return bool(price_lower_low and rsi_higher_low)
 
 
 def technical_cheapness(df: pd.DataFrame) -> TechnicalScore:
@@ -302,8 +324,11 @@ def technical_cheapness(df: pd.DataFrame) -> TechnicalScore:
 
     # Dip teyidi: MACD histogramı son 3 barda yukarı dönüyorsa (düşüş ivmesi kırıldı)
     dip_confirm = bool(len(mh) >= 4 and mh.iloc[-1] > mh.iloc[-2] > mh.iloc[-3])
+    # Pozitif RSI diverjansı (bağımsız, daha güçlü dip sinyali)
+    rsi_div = _bullish_rsi_divergence(df, rsi_d)
 
-    return TechnicalScore(total=round(total, 1), components=comp, raw=raw, dip_confirm=dip_confirm)
+    return TechnicalScore(total=round(total, 1), components=comp, raw=raw,
+                          dip_confirm=dip_confirm, rsi_divergence=rsi_div)
 
 
 # ====================================================================== #
@@ -570,6 +595,7 @@ class DeepValueResult:
     intrinsic_value: Optional[float] = None   # içsel değer (TL/hisse) — temel, teknikten AYRI
     safety_margin: Optional[float] = None     # (içsel değer / fiyat - 1)
     intrinsic_method: Optional[str] = None     # "Graham" / "FCF×8" vb.
+    avg_tl_volume: Optional[float] = None      # 20 günlük ortalama TL işlem hacmi (likidite)
 
 
 def composite_score(
@@ -617,6 +643,7 @@ def composite_score(
         intrinsic_value=_num(ratios.get("dcf_intrinsic_value")),
         safety_margin=_num(ratios.get("safety_margin")),
         intrinsic_method=ratios.get("intrinsic_method"),
+        avg_tl_volume=avg_tl_volume,
     )
 
 
@@ -749,7 +776,9 @@ def result_to_row(res: DeepValueResult) -> dict:
         "pos_52w": round(t.raw["pos_52w"], 3) if t.raw.get("pos_52w") is not None else None,
         "drawdown": round(t.raw["drawdown"], 3) if t.raw.get("drawdown") is not None else None,
         "dip_confirm": t.dip_confirm,
+        "rsi_diverjans": t.rsi_divergence,   # pozitif RSI diverjansı (güçlü dip sinyali)
         "birikim": b.accumulation,      # pozitif diverjans (banker topluyor)
+        "tl_hacim_M": round(res.avg_tl_volume / 1e6, 1) if res.avg_tl_volume else None,  # likidite (M TL)
         "trap_mult": res.trap.multiplier,
         "trap_flags": "; ".join(res.trap.flags) if res.trap.flags else "",
         "disqualified": res.trap.disqualified,
