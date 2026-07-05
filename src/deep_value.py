@@ -343,13 +343,19 @@ class BankerScore:
 
 
 def banker_accumulation(df: pd.DataFrame) -> BankerScore:
-    """"Banker"/akıllı para birikim skoru (0-100) — EKSTRA puanlama.
+    """"Banker"/akıllı para birikim skoru (0-100) — YALNIZCA zamanlama teyidi.
 
     Fikir: Aşırı ucuz bir hissede asıl aradığımız, fiyat düşerken ya da dipte
     yatarken GÜÇLÜ ELLERİN sessizce topladığının izidir. Klasik dip-avı sinyali
-    "pozitif diverjans"tır: fiyat düşük/yatay AMA para akışı (CMF, A/D, OBV)
-    yukarı. Bu skor yüksekse teknik ucuzluk daha güvenilirdir; düşükse hisse
-    hâlâ dağıtım (satış) altındadır — acele etme.
+    "pozitif diverjans"tır: fiyat düşük/yatay AMA para akışı (A/D, OBV, CMF)
+    YUKARI DÖNÜYOR.
+
+    ÖNEMLİ (backtest bulgusu): CMF/MFI'nin mutlak SEVİYESİNİ ödüllendirmek
+    ucuzlukla ters çalışıyordu (dövülmüş hissede seviye düşük olur), bu yüzden
+    skor teknik ucuzluğu iptal ediyordu (corr(tech,banker) ≈ −0.56). Yeni tasarım
+    seviyeyi değil DÖNÜŞÜ/birikimi ölçer: son ~5 barda para akışı yukarı mı,
+    fiyat düşerken A/D/OBV toparlıyor mu. Böylece banker, ucuzlukla çelişmeyen
+    bir "zamanlama teyidi" olur (çekirdek skoru değil, ince çarpan).
     """
     n = len(df)
     close = df["close"]
@@ -359,35 +365,48 @@ def banker_accumulation(df: pd.DataFrame) -> BankerScore:
     obv_s = obv(df)
 
     look = min(20, n - 1)
+    short = min(5, n - 1)
     price_chg = (close.iloc[-1] / close.iloc[-1 - look] - 1) if look > 0 else 0.0
     ad_chg = (ad.iloc[-1] - ad.iloc[-1 - look]) if look > 0 else 0.0
     obv_chg = (obv_s.iloc[-1] - obv_s.iloc[-1 - look]) if look > 0 else 0.0
     ad_norm = ad.abs().tail(60).mean() or 1.0
     obv_norm = obv_s.abs().tail(60).mean() or 1.0
+    ad_slope = float(ad_chg / ad_norm) if ad_norm else 0.0
+    obv_slope = float(obv_chg / obv_norm) if obv_norm else 0.0
+
+    # DÖNÜŞ ölçümleri (seviye DEĞİL): son ~5 barda para akışı toparlıyor mu?
+    cmf_now = float(cmf.iloc[-1])
+    cmf_prev = float(cmf.iloc[-1 - short]) if short > 0 else cmf_now
+    cmf_turn = cmf_now - cmf_prev
+    mfi_now = float(mfi.iloc[-1])
+    mfi_prev = float(mfi.iloc[-1 - short]) if short > 0 else mfi_now
+    mfi_turn = mfi_now - mfi_prev
 
     raw = {
-        "mfi": float(mfi.iloc[-1]),
-        "cmf": float(cmf.iloc[-1]),
+        "mfi": mfi_now,
+        "cmf": cmf_now,
+        "cmf_turn": float(cmf_turn),
+        "mfi_turn": float(mfi_turn),
         "price_chg_20": float(price_chg),
-        "ad_slope": float(ad_chg / ad_norm) if ad_norm else 0.0,
-        "obv_slope": float(obv_chg / obv_norm) if obv_norm else 0.0,
+        "ad_slope": ad_slope,
+        "obv_slope": obv_slope,
     }
 
     comp = {}
-    # CMF pozitife döndükçe birikim: -0.10 -> 0, +0.15 -> 100
-    comp["cmf"] = _ramp(raw["cmf"], -0.10, 0.15)
-    # MFI aşırı satımdan dönüş: MFI 15 (dip) düşük puan, 45 civarı (para dönüyor) yüksek.
-    #   Dikkat: burada "para GİRİYOR mu" istiyoruz; çok düşük MFI hâlâ çıkış demek.
-    comp["mfi"] = _ramp(raw["mfi"], 15.0, 45.0)
-    # A/D eğimi yukarı = birikim
-    comp["ad_slope"] = _ramp(raw["ad_slope"], -0.5, 0.5)
+    # A/D eğimi yukarı = birikim (fiyattan bağımsız net akım)
+    comp["ad_slope"] = _ramp(ad_slope, -0.4, 0.4)
     # OBV eğimi yukarı = birikim
-    comp["obv_slope"] = _ramp(raw["obv_slope"], -0.5, 0.5)
-    # Pozitif diverjans bonusu: fiyat düşmüş AMA para akışı yukarı
-    divergence = raw["price_chg_20"] < -0.02 and (raw["ad_slope"] > 0.05 or raw["cmf"] > 0.02)
-    comp["divergence"] = 100.0 if divergence else 40.0
+    comp["obv_slope"] = _ramp(obv_slope, -0.4, 0.4)
+    # CMF DÖNÜŞÜ yukarı (seviye değil): son 5 barda +0.12 artış = güçlü dönüş
+    comp["cmf_turn"] = _ramp(cmf_turn, -0.05, 0.12)
+    # MFI DÖNÜŞÜ yukarı: son 5 barda +15 puan artış = para dönüyor
+    comp["mfi_turn"] = _ramp(mfi_turn, -5.0, 15.0)
+    # POZİTİF DİVERJANS (çekirdek sinyal): fiyat düşmüş AMA net akım yukarı
+    divergence = price_chg < -0.02 and (ad_slope > 0.05 or obv_slope > 0.05 or cmf_turn > 0.02)
+    comp["divergence"] = 100.0 if divergence else 35.0
 
-    weights = {"cmf": 0.28, "mfi": 0.18, "ad_slope": 0.20, "obv_slope": 0.14, "divergence": 0.20}
+    weights = {"divergence": 0.34, "ad_slope": 0.20, "obv_slope": 0.14,
+               "cmf_turn": 0.18, "mfi_turn": 0.14}
     total = sum(weights[k] * comp[k] for k in weights)
     return BankerScore(total=round(total, 1), components=comp, raw=raw, accumulation=bool(divergence))
 
@@ -563,20 +582,29 @@ def assess_value_trap(
 # ====================================================================== #
 # 5. Nihai birleşik skor
 # ====================================================================== #
-# Mimari (kullanıcı kurgusu):
-#   ÖNCELİKLİ ÇEKİRDEK = teknik ucuzluk + banker (akıllı para). Sıralamayı bunlar belirler.
-#   PUANLAMA KATKISI    = temel değer/kalite -> yalnızca ÖLÇÜLÜ çarpan katkısı (±%20).
-#   VALUE-TRAP          = ceza çarpanı (çürük malı ele).
+# Mimari (kullanıcı kurgusu + backtest kanıtı):
+#   ÇEKİRDEK        = YALNIZCA teknik ucuzluk. Sıralamayı bu belirler (kanıtlı sinyal, corr +0.32).
+#   ZAMANLAMA TEYİDİ = banker (akıllı para dönüşü) + pozitif RSI diverjansı -> küçük çarpan.
+#   PUANLAMA KATKISI = temel değer/kalite -> yalnızca ÖLÇÜLÜ çarpan katkısı (±%20).
+#   VALUE-TRAP       = ceza çarpanı (çürük malı ele).
 #
-# final = çekirdek × trap_çarpanı × temel_katkı_çarpanı
-#   çekirdek = CORE_W_TECH·teknik + CORE_W_BANKER·banker   (ikisi de öncelikli)
-#   temel_katkı_çarpanı = 1 + FUND_BONUS_STRENGTH × (temel-50)/50   (±%20, sadece katkı)
-# "Aşırı ucuz" kapısı teknik ucuzluğa bakar (fiyat ne kadar dövülmüş); banker çekirdeğin
-# ikinci öncelikli bileşenidir (akıllı para topluyor mu). Temel yalnızca ince ayar yapar.
-TECH_GATE = 60.0             # "aşırı ucuz" eşiği (teknik): bunun altı derin-değer adayı sayılmaz
-CORE_W_TECH = 0.60           # ÖNCELİKLİ çekirdekte teknik ucuzluk ağırlığı
-CORE_W_BANKER = 0.40         # ÖNCELİKLİ çekirdekte banker/akıllı para ağırlığı
-FUND_BONUS_STRENGTH = 0.20   # temel kriter YALNIZCA puanlama katkısı (±%20)
+# final = teknik × trap_çarpanı × temel_katkı × zamanlama_teyidi
+#   zamanlama_teyidi = banker_çarpanı × diverjans_çarpanı
+#   banker_çarpanı  = 1 + BANKER_BONUS_STRENGTH × (banker-50)/50   (±%15)
+#   diverjans_çarpanı = 1 + RSI_DIV_BONUS  (pozitif RSI diverjansı varsa)
+#   temel_katkı     = 1 + FUND_BONUS_STRENGTH × (temel-50)/50   (±%20, sadece katkı)
+#
+# NEDEN banker artık çekirdek DEĞİL: point-in-time backtest'te teknik+banker 60/40
+# çekirdeği, sade teknikten DAHA ZAYIF öngörü verdi (corr +0.23 vs +0.32) — çünkü
+# banker'ın eski seviye-tabanlı hâli ucuzlukla ters çalışıyordu (corr −0.56). Banker
+# yeniden dönüş/birikim odaklı kurgulandı ve yalnızca ince bir zamanlama çarpanına
+# indirildi; böylece "birikim başlamış ucuz hisse" ELENMİYOR, hafifçe ÖNE çıkıyor
+# ama kanıtlı teknik sinyali iptal etmiyor. Pozitif RSI diverjansı ölçülen en güçlü
+# tekil sinyaldi (+~%6.8 ileriye dönük getiri) — ayrı bir çarpanla ödüllendiriliyor.
+TECH_GATE = 60.0              # "aşırı ucuz" eşiği (teknik): bunun altı derin-değer adayı sayılmaz
+BANKER_BONUS_STRENGTH = 0.15  # banker/akıllı para YALNIZCA zamanlama teyit çarpanı (±%15)
+RSI_DIV_BONUS = 0.08          # pozitif RSI diverjansı sabit zamanlama bonusu (+%8)
+FUND_BONUS_STRENGTH = 0.20    # temel kriter YALNIZCA puanlama katkısı (±%20)
 
 
 @dataclass
@@ -587,9 +615,10 @@ class DeepValueResult:
     banker: BankerScore
     fundamental: FundamentalScore
     trap: TrapAssessment
-    core_score: float                   # öncelikli çekirdek (teknik+banker)
+    core_score: float                   # çekirdek = teknik ucuzluk (sıralamayı belirleyen sinyal)
     fund_bonus: float                   # temel kriterin katkı çarpanı (≈0.80–1.20)
     qualifies: bool                     # teknik kapıyı geçti mi (aşırı ucuz mu)
+    timing_bonus: float = 1.0           # banker + RSI diverjansı zamanlama teyit çarpanı (≈0.85–1.24)
     ladder: Optional["FibLadder"] = None
     sector: Optional[str] = None
     intrinsic_value: Optional[float] = None   # içsel değer (TL/hisse) — temel, teknikten AYRI
@@ -607,17 +636,24 @@ def composite_score(
 ) -> DeepValueResult:
     """Bir hisse için tam derin-değer değerlendirmesi.
 
-    ÖNCELİKLİ ÇEKİRDEK = teknik ucuzluk + banker (akıllı para). Temel değer/kalite
-    bunun üstüne YALNIZCA ölçülü bir puanlama katkısı (±%20) uygular. Value-trap
-    bayrakları ayrıca ceza çarpanı getirir.
+    ÇEKİRDEK = YALNIZCA teknik ucuzluk (sıralamayı belirleyen kanıtlı sinyal).
+    Banker (akıllı para dönüşü) ve pozitif RSI diverjansı YALNIZCA küçük bir
+    zamanlama teyit çarpanı uygular; temel değer/kalite ölçülü bir puanlama
+    katkısı (±%20). Value-trap bayrakları ceza çarpanı getirir.
     """
     tech = technical_cheapness(df)
     banker = banker_accumulation(df)
     fund = fundamental_value_quality(ratios)
     trap = assess_value_trap(ratios, tech, avg_tl_volume=avg_tl_volume)
 
-    # Öncelikli çekirdek: teknik + banker (ikisi de öncelik)
-    core = _wmean([(tech.total, CORE_W_TECH), (banker.total, CORE_W_BANKER)]) or 0.0
+    # Çekirdek: yalnızca teknik ucuzluk (backtest: banker'ı çekirdeğe katmak sinyali zayıflatıyordu)
+    core = tech.total
+
+    # Zamanlama teyidi: banker dönüşü (±%15) × pozitif RSI diverjansı (+%8). Çekirdeği
+    # ezmeyecek kadar küçük; "birikim başlamış ucuz hisse"yi eler değil öne çıkarır.
+    banker_bonus = 1.0 + BANKER_BONUS_STRENGTH * (banker.total - 50.0) / 50.0
+    div_bonus = (1.0 + RSI_DIV_BONUS) if tech.rsi_divergence else 1.0
+    timing_bonus = banker_bonus * div_bonus
 
     # Temel kriter: yalnızca ölçülü katkı çarpanı (temel yoksa nötr)
     if fund.total is not None:
@@ -625,7 +661,7 @@ def composite_score(
     else:
         fund_bonus = 1.0
 
-    final = core * trap.multiplier * fund_bonus
+    final = core * trap.multiplier * fund_bonus * timing_bonus
     if trap.disqualified:
         final = 0.0
 
@@ -638,6 +674,7 @@ def composite_score(
         trap=trap,
         core_score=round(core, 1),
         fund_bonus=round(fund_bonus, 3),
+        timing_bonus=round(timing_bonus, 3),
         qualifies=bool(tech.total >= TECH_GATE and not trap.disqualified),
         sector=sector,
         intrinsic_value=_num(ratios.get("dcf_intrinsic_value")),
@@ -761,9 +798,10 @@ def result_to_row(res: DeepValueResult) -> dict:
         "sector": res.sector,
         "final_score": res.final_score,
         "asiri_ucuz": res.qualifies,
-        "cekirdek": res.core_score,     # ÖNCELİK: teknik+banker
-        "tech_ucuzluk": t.total,        # öncelik 1
-        "banker": b.total,              # öncelik 2: akıllı para birikimi
+        "cekirdek": res.core_score,     # ÇEKİRDEK = teknik ucuzluk (sıralamayı belirler)
+        "tech_ucuzluk": t.total,        # çekirdek sinyal
+        "banker": b.total,              # zamanlama teyidi: akıllı para dönüşü/birikimi
+        "zamanlama_carpan": res.timing_bonus,  # banker + RSI diverjansı çarpanı (≈0.85–1.24)
         "temel_skor": f.total,          # katkı: değer & kalite
         "temel_carpan": res.fund_bonus, # temelin nihai skora çarpan katkısı
         "value": f.value,
