@@ -57,7 +57,24 @@ Farklı fiyat-ölçekli isimleri birlikte havuzlamak mutlak korelasyonu seyrelti
 - Bu ortamda **TradingView (data.tradingview.com) egress politikası ile 403** — borsapy'nin doğrudan Python history çağrısı çalışmıyor. **Veri yalnızca BIST MCP tool'u (`get_historical_data`) üzerinden** geliyor (server-side). Bu yüzden geniş universe backtest'i pahalı (her isim context'e dökülüyor).
 - Notebook Colab'da tvdatafeed ile çalışıyor (orası TV'ye erişebiliyor); backtest bu ortamda MCP ile yapıldı.
 
+## 6b. Bugünkü CANLI tarama çıktısı (2026-07-05, entry_asof 2026-07-03)
+- Taranan **602** hisse · aşırı-ucuz kapıyı geçen **109** · aday **25** · tuzak **129** · diskalifiye 0.
+- Aday tipleri: birikim 13, birikim-spek 7, birikim+dip 5.
+- **İleri getiri takibi kuruldu:** `notes/forward_track/` — snapshot `2026-07-05_adaylar_snapshot.csv`
+  (25 aday, skorlar + hedef/stop) ve `track_returns.py` (kontrol gününde getiri/hedef/stop ölçer).
+  Giriş fiyatı saklanmadı; kontrol gününde geçmişten (2026-07-03 kapanışı) okunuyor.
+- **En yüksek final skorlu adaylar:** GENTS 93.7 (Sanayi, birikim+dip, tech 79/banker 63/temel 84),
+  FORMT 81.9 (Madencilik), LMKDC 77.8 (Madencilik, birikim+dip), KRGYO 73.6 (GYO),
+  IHGZT 71.7, KZBGY 71.3, IHLGM 70.2 (temel 95, güv.marjı %168), DERHL 65.8 (birikim-spek).
+- **Motor doğru çalışıyor teyidi:** en dövülmüş RSI'lar (KONTR 25.6, TRILC 25.1, CANTE 27.4,
+  ALGYO 24.9, OBAMS 24.7) aday DEĞİL → hepsi tuzak (UCUZ_CUNKU_ZARAR / EV/EBITDA_PAHALI /
+  DUSEN_BICAK). Yani "en ucuz ≠ en iyi" mantığı sahada işliyor.
+- Not: `Alim_Plani` sayfası yalnızca 25 üst-skorlu isme merdiven kuruyor; 8'i adaylarla örtüşüyor.
+  Kalan 17 adayın giriş fiyatı takip anında geçmişten okunacak (tracker bunu yapıyor).
+
 ## 7. Yarın için açık başlıklar (öneri)
+- [ ] **İlk forward check:** `track_returns.py` ile 25 adayın 2026-07-03→bugün getirisini ölç;
+      tip (birikim/spek/dip) ve final_score kovalarına göre erken sinyal var mı bak.
 - [ ] Karar: mevcut tasarımı dondurup canlı tarama çıktısını mı değerlendirelim, yoksa `BANKER_BONUS_STRENGTH`/`RSI_DIV_BONUS` katsayılarını daha geniş universe ile ince mi ayarlayalım?
 - [ ] tech≥70 "düşen bıçak" kovası için ek filtre (ör. dip_confirm zorunlu) test edilebilir.
 - [ ] İstenirse likidite eşiği (`MIN_LIQ`) ve sektör çeşitlendirme (`MAX_SEKTOR`) knob'larını canlı çıktı üstünde kalibre et.
