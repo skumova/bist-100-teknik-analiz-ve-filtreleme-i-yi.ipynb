@@ -60,9 +60,11 @@ Farklı fiyat-ölçekli isimleri birlikte havuzlamak mutlak korelasyonu seyrelti
 ## 6b. Bugünkü CANLI tarama çıktısı (2026-07-05, entry_asof 2026-07-03)
 - Taranan **602** hisse · aşırı-ucuz kapıyı geçen **109** · aday **25** · tuzak **129** · diskalifiye 0.
 - Aday tipleri: birikim 13, birikim-spek 7, birikim+dip 5.
-- **İleri getiri takibi kuruldu:** `notes/forward_track/` — snapshot `2026-07-05_adaylar_snapshot.csv`
-  (25 aday, skorlar + hedef/stop) ve `track_returns.py` (kontrol gününde getiri/hedef/stop ölçer).
-  Giriş fiyatı saklanmadı; kontrol gününde geçmişten (2026-07-03 kapanışı) okunuyor.
+- **İleri getiri takibi KODA push EDİLMİYOR (kullanıcı tercihi).** Takip sohbet üzerinden yürür:
+  kullanıcı her tarama günü çıktıyı (Excel/aday listesi) paylaşır; kohort olarak kaydedilir,
+  ≥2 gün birikince adayların giriş→güncel getirisi (MCP fiyatlarıyla) hesaplanıp skor tablosu tutulur.
+  Kohort mantığı: her tarama günü = ayrı kohort, kendi giriş gününden T+3/5/10/20'de ölçülür;
+  günler eklendikçe hem yeni kohort eklenir hem eski kohortlar olgunlaşır.
 - **En yüksek final skorlu adaylar:** GENTS 93.7 (Sanayi, birikim+dip, tech 79/banker 63/temel 84),
   FORMT 81.9 (Madencilik), LMKDC 77.8 (Madencilik, birikim+dip), KRGYO 73.6 (GYO),
   IHGZT 71.7, KZBGY 71.3, IHLGM 70.2 (temel 95, güv.marjı %168), DERHL 65.8 (birikim-spek).
@@ -73,8 +75,8 @@ Farklı fiyat-ölçekli isimleri birlikte havuzlamak mutlak korelasyonu seyrelti
   Kalan 17 adayın giriş fiyatı takip anında geçmişten okunacak (tracker bunu yapıyor).
 
 ## 7. Yarın için açık başlıklar (öneri)
-- [ ] **İlk forward check:** `track_returns.py` ile 25 adayın 2026-07-03→bugün getirisini ölç;
-      tip (birikim/spek/dip) ve final_score kovalarına göre erken sinyal var mı bak.
+- [ ] **İlk forward check (sohbette):** kullanıcı yeni gün çıktısını paylaşınca 2026-07-05 kohortunun
+      giriş→güncel getirisini hesapla; tip (birikim/spek/dip) ve final_score kovalarına göre ayrışma var mı bak.
 - [ ] Karar: mevcut tasarımı dondurup canlı tarama çıktısını mı değerlendirelim, yoksa `BANKER_BONUS_STRENGTH`/`RSI_DIV_BONUS` katsayılarını daha geniş universe ile ince mi ayarlayalım?
 - [ ] tech≥70 "düşen bıçak" kovası için ek filtre (ör. dip_confirm zorunlu) test edilebilir.
 - [ ] İstenirse likidite eşiği (`MIN_LIQ`) ve sektör çeşitlendirme (`MAX_SEKTOR`) knob'larını canlı çıktı üstünde kalibre et.
