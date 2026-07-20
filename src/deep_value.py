@@ -234,7 +234,29 @@ class TechnicalScore:
     total: float
     components: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
-    dip_confirm: bool = False   # MACD histogramı yukarı dönüyor mu (düşüş ivmesi kırıldı)
+    dip_confirm: bool = False       # MACD histogramı yukarı dönüyor mu (düşüş ivmesi kırıldı)
+    rsi_divergence: bool = False    # pozitif RSI diverjansı (fiyat daha dip, RSI daha yüksek)
+
+
+def _bullish_rsi_divergence(df: pd.DataFrame, rsi_series: pd.Series,
+                            lookback: int = 40, min_gap: int = 5) -> bool:
+    """Pozitif (boğa) RSI diverjansı: fiyat yeni/eşit dip yaparken RSI daha yüksek dip
+    yapıyor → satış ivmesi tükeniyor, klasik dip/dönüş sinyali."""
+    n = len(df)
+    lb = min(lookback, n - 2)
+    if lb < 12:
+        return False
+    lows = df["low"].tail(lb).reset_index(drop=True)
+    rsis = rsi_series.tail(lb).reset_index(drop=True)
+    prior = lows.iloc[:-min_gap]
+    recent = lows.iloc[-min_gap:]
+    if len(prior) < 3 or len(recent) < 1:
+        return False
+    p_idx = int(prior.idxmin())     # prior/recent, lows ile aynı konumsal indeksi paylaşır
+    r_idx = int(recent.idxmin())
+    price_lower_low = lows.iloc[r_idx] <= lows.iloc[p_idx] * 1.01     # fiyat daha dip/eşit
+    rsi_higher_low = rsis.iloc[r_idx] > rsis.iloc[p_idx] + 2          # RSI daha yüksek dip
+    return bool(price_lower_low and rsi_higher_low)
 
 
 def technical_cheapness(df: pd.DataFrame) -> TechnicalScore:
@@ -302,8 +324,11 @@ def technical_cheapness(df: pd.DataFrame) -> TechnicalScore:
 
     # Dip teyidi: MACD histogramı son 3 barda yukarı dönüyorsa (düşüş ivmesi kırıldı)
     dip_confirm = bool(len(mh) >= 4 and mh.iloc[-1] > mh.iloc[-2] > mh.iloc[-3])
+    # Pozitif RSI diverjansı (bağımsız, daha güçlü dip sinyali)
+    rsi_div = _bullish_rsi_divergence(df, rsi_d)
 
-    return TechnicalScore(total=round(total, 1), components=comp, raw=raw, dip_confirm=dip_confirm)
+    return TechnicalScore(total=round(total, 1), components=comp, raw=raw,
+                          dip_confirm=dip_confirm, rsi_divergence=rsi_div)
 
 
 # ====================================================================== #
@@ -318,13 +343,19 @@ class BankerScore:
 
 
 def banker_accumulation(df: pd.DataFrame) -> BankerScore:
-    """"Banker"/akıllı para birikim skoru (0-100) — EKSTRA puanlama.
+    """"Banker"/akıllı para birikim skoru (0-100) — YALNIZCA zamanlama teyidi.
 
     Fikir: Aşırı ucuz bir hissede asıl aradığımız, fiyat düşerken ya da dipte
     yatarken GÜÇLÜ ELLERİN sessizce topladığının izidir. Klasik dip-avı sinyali
-    "pozitif diverjans"tır: fiyat düşük/yatay AMA para akışı (CMF, A/D, OBV)
-    yukarı. Bu skor yüksekse teknik ucuzluk daha güvenilirdir; düşükse hisse
-    hâlâ dağıtım (satış) altındadır — acele etme.
+    "pozitif diverjans"tır: fiyat düşük/yatay AMA para akışı (A/D, OBV, CMF)
+    YUKARI DÖNÜYOR.
+
+    ÖNEMLİ (backtest bulgusu): CMF/MFI'nin mutlak SEVİYESİNİ ödüllendirmek
+    ucuzlukla ters çalışıyordu (dövülmüş hissede seviye düşük olur), bu yüzden
+    skor teknik ucuzluğu iptal ediyordu (corr(tech,banker) ≈ −0.56). Yeni tasarım
+    seviyeyi değil DÖNÜŞÜ/birikimi ölçer: son ~5 barda para akışı yukarı mı,
+    fiyat düşerken A/D/OBV toparlıyor mu. Böylece banker, ucuzlukla çelişmeyen
+    bir "zamanlama teyidi" olur (çekirdek skoru değil, ince çarpan).
     """
     n = len(df)
     close = df["close"]
@@ -334,35 +365,48 @@ def banker_accumulation(df: pd.DataFrame) -> BankerScore:
     obv_s = obv(df)
 
     look = min(20, n - 1)
+    short = min(5, n - 1)
     price_chg = (close.iloc[-1] / close.iloc[-1 - look] - 1) if look > 0 else 0.0
     ad_chg = (ad.iloc[-1] - ad.iloc[-1 - look]) if look > 0 else 0.0
     obv_chg = (obv_s.iloc[-1] - obv_s.iloc[-1 - look]) if look > 0 else 0.0
     ad_norm = ad.abs().tail(60).mean() or 1.0
     obv_norm = obv_s.abs().tail(60).mean() or 1.0
+    ad_slope = float(ad_chg / ad_norm) if ad_norm else 0.0
+    obv_slope = float(obv_chg / obv_norm) if obv_norm else 0.0
+
+    # DÖNÜŞ ölçümleri (seviye DEĞİL): son ~5 barda para akışı toparlıyor mu?
+    cmf_now = float(cmf.iloc[-1])
+    cmf_prev = float(cmf.iloc[-1 - short]) if short > 0 else cmf_now
+    cmf_turn = cmf_now - cmf_prev
+    mfi_now = float(mfi.iloc[-1])
+    mfi_prev = float(mfi.iloc[-1 - short]) if short > 0 else mfi_now
+    mfi_turn = mfi_now - mfi_prev
 
     raw = {
-        "mfi": float(mfi.iloc[-1]),
-        "cmf": float(cmf.iloc[-1]),
+        "mfi": mfi_now,
+        "cmf": cmf_now,
+        "cmf_turn": float(cmf_turn),
+        "mfi_turn": float(mfi_turn),
         "price_chg_20": float(price_chg),
-        "ad_slope": float(ad_chg / ad_norm) if ad_norm else 0.0,
-        "obv_slope": float(obv_chg / obv_norm) if obv_norm else 0.0,
+        "ad_slope": ad_slope,
+        "obv_slope": obv_slope,
     }
 
     comp = {}
-    # CMF pozitife döndükçe birikim: -0.10 -> 0, +0.15 -> 100
-    comp["cmf"] = _ramp(raw["cmf"], -0.10, 0.15)
-    # MFI aşırı satımdan dönüş: MFI 15 (dip) düşük puan, 45 civarı (para dönüyor) yüksek.
-    #   Dikkat: burada "para GİRİYOR mu" istiyoruz; çok düşük MFI hâlâ çıkış demek.
-    comp["mfi"] = _ramp(raw["mfi"], 15.0, 45.0)
-    # A/D eğimi yukarı = birikim
-    comp["ad_slope"] = _ramp(raw["ad_slope"], -0.5, 0.5)
+    # A/D eğimi yukarı = birikim (fiyattan bağımsız net akım)
+    comp["ad_slope"] = _ramp(ad_slope, -0.4, 0.4)
     # OBV eğimi yukarı = birikim
-    comp["obv_slope"] = _ramp(raw["obv_slope"], -0.5, 0.5)
-    # Pozitif diverjans bonusu: fiyat düşmüş AMA para akışı yukarı
-    divergence = raw["price_chg_20"] < -0.02 and (raw["ad_slope"] > 0.05 or raw["cmf"] > 0.02)
-    comp["divergence"] = 100.0 if divergence else 40.0
+    comp["obv_slope"] = _ramp(obv_slope, -0.4, 0.4)
+    # CMF DÖNÜŞÜ yukarı (seviye değil): son 5 barda +0.12 artış = güçlü dönüş
+    comp["cmf_turn"] = _ramp(cmf_turn, -0.05, 0.12)
+    # MFI DÖNÜŞÜ yukarı: son 5 barda +15 puan artış = para dönüyor
+    comp["mfi_turn"] = _ramp(mfi_turn, -5.0, 15.0)
+    # POZİTİF DİVERJANS (çekirdek sinyal): fiyat düşmüş AMA net akım yukarı
+    divergence = price_chg < -0.02 and (ad_slope > 0.05 or obv_slope > 0.05 or cmf_turn > 0.02)
+    comp["divergence"] = 100.0 if divergence else 35.0
 
-    weights = {"cmf": 0.28, "mfi": 0.18, "ad_slope": 0.20, "obv_slope": 0.14, "divergence": 0.20}
+    weights = {"divergence": 0.34, "ad_slope": 0.20, "obv_slope": 0.14,
+               "cmf_turn": 0.18, "mfi_turn": 0.14}
     total = sum(weights[k] * comp[k] for k in weights)
     return BankerScore(total=round(total, 1), components=comp, raw=raw, accumulation=bool(divergence))
 
@@ -538,19 +582,29 @@ def assess_value_trap(
 # ====================================================================== #
 # 5. Nihai birleşik skor
 # ====================================================================== #
-# Mimari (kullanıcı kurgusu):
-#   ANA BELİRLEYİCİ = teknik ucuzluk. Sıralamanın çıpası ve "aşırı ucuz" kapısı.
-#   EKSTRA PUANLAMA  = banker (akıllı para) + temel değer/kalite -> çarpan bonus.
+# Mimari (kullanıcı kurgusu + backtest kanıtı):
+#   ÇEKİRDEK        = YALNIZCA teknik ucuzluk. Sıralamayı bu belirler (kanıtlı sinyal, corr +0.32).
+#   ZAMANLAMA TEYİDİ = banker (akıllı para dönüşü) + pozitif RSI diverjansı -> küçük çarpan.
+#   PUANLAMA KATKISI = temel değer/kalite -> yalnızca ÖLÇÜLÜ çarpan katkısı (±%20).
 #   VALUE-TRAP       = ceza çarpanı (çürük malı ele).
 #
-# final = teknik × trap_çarpanı × bonus_çarpanı
-#   bonus_çarpanı = 1 + BONUS_STRENGTH × (ekstra-50)/50   (ekstra 0-100)
-#   -> ekstra=50 nötr (×1.0), ekstra=100 → ×(1+BONUS_STRENGTH), ekstra=0 → ×(1-BONUS_STRENGTH)
-# Böylece teknik çıpa kalır ama banker+temel sıralamayı anlamlı biçimde oynatır.
-TECH_GATE = 55.0            # "aşırı ucuz" eşiği: bunun altı derin-değer adayı sayılmaz
-BONUS_STRENGTH = 0.35       # ekstra katmanın nihai skoru oynatma gücü (±%35)
-EXTRA_W_BANKER = 0.45       # ekstra puan içinde banker ağırlığı
-EXTRA_W_FUND = 0.55         # ekstra puan içinde temel değer/kalite ağırlığı
+# final = teknik × trap_çarpanı × temel_katkı × zamanlama_teyidi
+#   zamanlama_teyidi = banker_çarpanı × diverjans_çarpanı
+#   banker_çarpanı  = 1 + BANKER_BONUS_STRENGTH × (banker-50)/50   (±%15)
+#   diverjans_çarpanı = 1 + RSI_DIV_BONUS  (pozitif RSI diverjansı varsa)
+#   temel_katkı     = 1 + FUND_BONUS_STRENGTH × (temel-50)/50   (±%20, sadece katkı)
+#
+# NEDEN banker artık çekirdek DEĞİL: point-in-time backtest'te teknik+banker 60/40
+# çekirdeği, sade teknikten DAHA ZAYIF öngörü verdi (corr +0.23 vs +0.32) — çünkü
+# banker'ın eski seviye-tabanlı hâli ucuzlukla ters çalışıyordu (corr −0.56). Banker
+# yeniden dönüş/birikim odaklı kurgulandı ve yalnızca ince bir zamanlama çarpanına
+# indirildi; böylece "birikim başlamış ucuz hisse" ELENMİYOR, hafifçe ÖNE çıkıyor
+# ama kanıtlı teknik sinyali iptal etmiyor. Pozitif RSI diverjansı ölçülen en güçlü
+# tekil sinyaldi (+~%6.8 ileriye dönük getiri) — ayrı bir çarpanla ödüllendiriliyor.
+TECH_GATE = 60.0              # "aşırı ucuz" eşiği (teknik): bunun altı derin-değer adayı sayılmaz
+BANKER_BONUS_STRENGTH = 0.15  # banker/akıllı para YALNIZCA zamanlama teyit çarpanı (±%15)
+RSI_DIV_BONUS = 0.08          # pozitif RSI diverjansı sabit zamanlama bonusu (+%8)
+FUND_BONUS_STRENGTH = 0.20    # temel kriter YALNIZCA puanlama katkısı (±%20)
 
 
 @dataclass
@@ -561,10 +615,16 @@ class DeepValueResult:
     banker: BankerScore
     fundamental: FundamentalScore
     trap: TrapAssessment
-    extra_score: float
+    core_score: float                   # çekirdek = teknik ucuzluk (sıralamayı belirleyen sinyal)
+    fund_bonus: float                   # temel kriterin katkı çarpanı (≈0.80–1.20)
     qualifies: bool                     # teknik kapıyı geçti mi (aşırı ucuz mu)
+    timing_bonus: float = 1.0           # banker + RSI diverjansı zamanlama teyit çarpanı (≈0.85–1.24)
     ladder: Optional["FibLadder"] = None
     sector: Optional[str] = None
+    intrinsic_value: Optional[float] = None   # içsel değer (TL/hisse) — temel, teknikten AYRI
+    safety_margin: Optional[float] = None     # (içsel değer / fiyat - 1)
+    intrinsic_method: Optional[str] = None     # "Graham" / "FCF×8" vb.
+    avg_tl_volume: Optional[float] = None      # 20 günlük ortalama TL işlem hacmi (likidite)
 
 
 def composite_score(
@@ -576,22 +636,32 @@ def composite_score(
 ) -> DeepValueResult:
     """Bir hisse için tam derin-değer değerlendirmesi.
 
-    Teknik ucuzluk ANA skordur; banker (akıllı para birikimi) ve temel
-    değer/kalite bunun üstüne EKSTRA çarpan bonusu uygular. Value-trap
-    bayrakları ayrıca ceza çarpanı getirir.
+    ÇEKİRDEK = YALNIZCA teknik ucuzluk (sıralamayı belirleyen kanıtlı sinyal).
+    Banker (akıllı para dönüşü) ve pozitif RSI diverjansı YALNIZCA küçük bir
+    zamanlama teyit çarpanı uygular; temel değer/kalite ölçülü bir puanlama
+    katkısı (±%20). Value-trap bayrakları ceza çarpanı getirir.
     """
     tech = technical_cheapness(df)
     banker = banker_accumulation(df)
     fund = fundamental_value_quality(ratios)
     trap = assess_value_trap(ratios, tech, avg_tl_volume=avg_tl_volume)
 
-    # Ekstra puan: banker + temel (temel None ise sadece banker)
-    extra = _wgeomean([(banker.total, EXTRA_W_BANKER), (fund.total, EXTRA_W_FUND)])
-    if extra is None:
-        extra = 50.0  # ekstra bilgi yoksa nötr
-    bonus_mult = 1.0 + BONUS_STRENGTH * (extra - 50.0) / 50.0
+    # Çekirdek: yalnızca teknik ucuzluk (backtest: banker'ı çekirdeğe katmak sinyali zayıflatıyordu)
+    core = tech.total
 
-    final = tech.total * trap.multiplier * bonus_mult
+    # Zamanlama teyidi: banker dönüşü (±%15) × pozitif RSI diverjansı (+%8). Çekirdeği
+    # ezmeyecek kadar küçük; "birikim başlamış ucuz hisse"yi eler değil öne çıkarır.
+    banker_bonus = 1.0 + BANKER_BONUS_STRENGTH * (banker.total - 50.0) / 50.0
+    div_bonus = (1.0 + RSI_DIV_BONUS) if tech.rsi_divergence else 1.0
+    timing_bonus = banker_bonus * div_bonus
+
+    # Temel kriter: yalnızca ölçülü katkı çarpanı (temel yoksa nötr)
+    if fund.total is not None:
+        fund_bonus = 1.0 + FUND_BONUS_STRENGTH * (fund.total - 50.0) / 50.0
+    else:
+        fund_bonus = 1.0
+
+    final = core * trap.multiplier * fund_bonus * timing_bonus
     if trap.disqualified:
         final = 0.0
 
@@ -602,9 +672,15 @@ def composite_score(
         banker=banker,
         fundamental=fund,
         trap=trap,
-        extra_score=round(extra, 1),
+        core_score=round(core, 1),
+        fund_bonus=round(fund_bonus, 3),
+        timing_bonus=round(timing_bonus, 3),
         qualifies=bool(tech.total >= TECH_GATE and not trap.disqualified),
         sector=sector,
+        intrinsic_value=_num(ratios.get("dcf_intrinsic_value")),
+        safety_margin=_num(ratios.get("safety_margin")),
+        intrinsic_method=ratios.get("intrinsic_method"),
+        avg_tl_volume=avg_tl_volume,
     )
 
 
@@ -616,10 +692,11 @@ class FibLadder:
     swing_high: float
     swing_low: float
     current_price: float
-    rungs: list[dict]          # her biri: {ratio, price, weight_pct, note}
+    rungs: list[dict]          # her biri: {ratio, price, weight_pct, note, dip_pct}
     hard_stop: float
     dcf_target: Optional[float] = None
     expected_upside_pct: Optional[float] = None
+    mid_recovery: Optional[float] = None    # konservatif teknik hedef: H->L düşüşünün %50 geri alımı
 
 
 # Düşüşün Fibonacci oranları (H->L düşüşünün kesri olarak) ve dilim ağırlıkları.
@@ -641,71 +718,59 @@ def fibonacci_ladder(
     n_rungs: int = 3,
     atr_stop_mult: float = 1.5,
     dcf_target: Optional[float] = None,
+    max_depth: float = 0.22,
 ) -> FibLadder:
-    """Dövülmüş hisse için kademeli alım merdiveni.
+    """Dövülmüş hisse için SINIRLI, UYGULANABİLİR kademeli alım merdiveni.
 
-    Mantık: son `lookback` bardaki baskın SWING'i (en yüksek tepe H, en düşük
-    dip L) al. H->L düşüşünün Fibonacci seviyeleri referans alınır. Alım
-    kademeleri yalnızca GÜNCEL FİYATIN ALTINDAKİ (ya da hemen üstündeki)
-    seviyelere konur — hisse düştükçe kademeli alırsın, ortalama maliyet düşer.
-    Daha derin kademeye daha çok ağırlık verilir.
-
-    Stop: en derin kademenin ATR katı kadar altına konur ("bu da tutmazsa tez
-    yanlış" seviyesi).
+    Tasarım gerekçesi: Fibonacci UZANTILARINI (1.272/1.618) tüm swing aralığının
+    altına projekte etmek, geniş aralıklı BIST hisselerinde en derin kademeyi
+    güncelin %60-80 altına atıyordu (gerçekleşmeyecek, sermaye yanlış tahsisi).
+    Bunun yerine kademeler GÜNCEL FİYAT ile bir TABAN (floor) arasına konur:
+      * taban = son swing dip (gerçek destek),
+      * fiyat zaten dipteyse band ~%10 kapitülasyon için aşağı uzatılır,
+      * hiçbir kademe güncelin `max_depth`'ından (vars. %22) daha derin olmaz.
+    Band, Fibonacci geri-çekilme oranlarıyla (0 / 0.5 / 1.0) 3 kademeye bölünür;
+    daha derin kademeye biraz daha çok ağırlık verilir. Stop, band tabanının ATR
+    katı altına konur (mantıklı bir aralıkta sınırlanır).
     """
     win = df.tail(lookback)
     H = float(win["high"].max())
     L = float(win["low"].min())
     price = float(df["close"].iloc[-1])
-    rng = max(H - L, 1e-9)
-    atr_val = float(atr(df, 14).iloc[-1]) if len(df) > 15 else rng * 0.03
+    atr_val = float(atr(df, 14).iloc[-1]) if len(df) > 15 else price * 0.03
 
-    # Aday seviyeler (fiyat cinsinden). ratio, düşüşün kesri: price_r = H - ratio*(H-L)
-    candidates = []
-    for ratio, note in _FIB_RATIOS:
-        lvl = H - ratio * rng
-        candidates.append({"ratio": ratio, "price": round(lvl, 4), "note": note})
+    # --- Alım bandı tabanı (floor): sınırlı ve uygulanabilir ---
+    floor_c = min(L, price * 0.995)                    # swing dip ya da güncelin hemen altı
+    if price - floor_c < price * 0.08:                 # fiyat zaten dipte -> kapitülasyon için band aç
+        floor_c = price * 0.90
+    floor = max(floor_c, price * (1.0 - max_depth))    # güncelin en fazla max_depth altı
+    band = max(price - floor, price * 0.02)
 
-    # Yalnızca güncel fiyatın %2 üstü ve altındaki seviyeler alım kademesi olur
-    buyable = [c for c in candidates if c["price"] <= price * 1.02]
-    # Güncel fiyata en yakından başlayıp aşağı doğru sırala
-    buyable.sort(key=lambda c: -c["price"])
-
-    # İlk kademe güncel fiyata yakın olsun: en yakın buyable seviye %6'dan fazla
-    # aşağıdaysa, ilk kademe olarak MEVCUT FİYATı ekle (hemen birikime başla).
-    if not buyable or buyable[0]["price"] < price * 0.94:
-        buyable.insert(0, {"ratio": 0.0, "price": round(price, 4), "note": "mevcut fiyat (ilk kademe)"})
-
-    rungs = buyable[:n_rungs]
-    # 3 kademeye tamamlanamadıysa swing dip / uzantı ile doldur
-    if len(rungs) < n_rungs:
-        for ratio, note in [(1.0, "swing dip retesti"), (1.272, "kapitülasyon uzantısı"), (1.618, "aşırı kapitülasyon")]:
-            lvl = round(H - ratio * rng, 4)
-            if lvl < rungs[-1]["price"] and all(abs(lvl - r["price"]) > 1e-6 for r in rungs):
-                rungs.append({"ratio": ratio, "price": lvl, "note": note})
-            if len(rungs) >= n_rungs:
-                break
-
-    # Ağırlıklar: derine daha çok. n_rungs'a göre artan profil.
-    base_weights = {
-        1: [1.0],
-        2: [0.4, 0.6],
-        3: [0.25, 0.35, 0.40],
-        4: [0.20, 0.25, 0.30, 0.25],
-        5: [0.15, 0.20, 0.25, 0.25, 0.15],
-    }.get(len(rungs), None)
-    if base_weights is None:
-        base_weights = [1.0 / len(rungs)] * len(rungs)
-    for rung, w in zip(rungs, base_weights):
-        rung["weight_pct"] = round(w * 100, 1)
+    # --- 3 kademe: bandı Fibonacci geri-çekilme oranlarıyla böl (0=güncel, 1=taban) ---
+    rung_specs = [
+        (0.0, "1. kademe — güncel / hafif dip"),
+        (0.5, "2. kademe — orta dip (0.5 Fib)"),
+        (1.0, "3. kademe — band tabanı (swing dip / kapitülasyon)"),
+    ][:n_rungs]
+    weight_profiles = {1: [1.0], 2: [0.45, 0.55], 3: [0.30, 0.33, 0.37]}
+    ws = weight_profiles.get(n_rungs, [1.0 / n_rungs] * n_rungs)
+    rungs = []
+    for (ratio, note), w in zip(rung_specs, ws):
+        p = price - ratio * band
+        rungs.append({"ratio": round(ratio, 3), "price": round(p, 4),
+                      "weight_pct": round(w * 100, 1), "note": note,
+                      "dip_pct": round((p / price - 1) * 100, 1)})
 
     deepest = min(r["price"] for r in rungs)
-    hard_stop = round(deepest - atr_stop_mult * atr_val, 4)
+    # Stop: band tabanının ATR katı altı; sanity ile en fazla (max_depth+%10) aşağı
+    hard_stop = round(max(deepest - atr_stop_mult * atr_val, price * (1.0 - max_depth - 0.10)), 4)
 
+    # Konservatif teknik toparlanma hedefi: H->L düşüşünün %50'sinin geri alınması
+    mid_recovery = round(L + 0.5 * (H - L), 4)
+
+    avg_cost = sum(r["price"] * r["weight_pct"] for r in rungs) / sum(r["weight_pct"] for r in rungs)
     upside = None
     if dcf_target is not None and dcf_target > 0:
-        # Merdivenin ağırlıklı ortalama maliyetine göre beklenen getiri
-        avg_cost = sum(r["price"] * r["weight_pct"] for r in rungs) / sum(r["weight_pct"] for r in rungs)
         upside = round((dcf_target / avg_cost - 1) * 100, 1)
 
     return FibLadder(
@@ -716,6 +781,7 @@ def fibonacci_ladder(
         hard_stop=hard_stop,
         dcf_target=dcf_target,
         expected_upside_pct=upside,
+        mid_recovery=mid_recovery,
     )
 
 
@@ -732,18 +798,25 @@ def result_to_row(res: DeepValueResult) -> dict:
         "sector": res.sector,
         "final_score": res.final_score,
         "asiri_ucuz": res.qualifies,
-        "tech_ucuzluk": t.total,        # ANA belirleyici
-        "banker": b.total,              # ekstra: akıllı para birikimi
-        "temel_skor": f.total,          # ekstra: değer & kalite
-        "extra": res.extra_score,
+        "cekirdek": res.core_score,     # ÇEKİRDEK = teknik ucuzluk (sıralamayı belirler)
+        "tech_ucuzluk": t.total,        # çekirdek sinyal
+        "banker": b.total,              # zamanlama teyidi: akıllı para dönüşü/birikimi
+        "zamanlama_carpan": res.timing_bonus,  # banker + RSI diverjansı çarpanı (≈0.85–1.24)
+        "temel_skor": f.total,          # katkı: değer & kalite
+        "temel_carpan": res.fund_bonus, # temelin nihai skora çarpan katkısı
         "value": f.value,
         "quality": f.quality,
+        "icsel_deger": res.intrinsic_value,                    # temel: içsel değer (TL/hisse)
+        "guvenlik_marji_%": round(res.safety_margin * 100, 1) if res.safety_margin is not None else None,
+        "deger_yontemi": res.intrinsic_method,
         "rsi_d": round(t.raw.get("rsi_d"), 1) if t.raw.get("rsi_d") is not None else None,
         "rsi_w": round(t.raw["rsi_w"], 1) if t.raw.get("rsi_w") is not None else None,
         "pos_52w": round(t.raw["pos_52w"], 3) if t.raw.get("pos_52w") is not None else None,
         "drawdown": round(t.raw["drawdown"], 3) if t.raw.get("drawdown") is not None else None,
         "dip_confirm": t.dip_confirm,
+        "rsi_diverjans": t.rsi_divergence,   # pozitif RSI diverjansı (güçlü dip sinyali)
         "birikim": b.accumulation,      # pozitif diverjans (banker topluyor)
+        "tl_hacim_M": round(res.avg_tl_volume / 1e6, 1) if res.avg_tl_volume else None,  # likidite (M TL)
         "trap_mult": res.trap.multiplier,
         "trap_flags": "; ".join(res.trap.flags) if res.trap.flags else "",
         "disqualified": res.trap.disqualified,
